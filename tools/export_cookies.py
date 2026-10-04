@@ -6,6 +6,10 @@ daemon at 127.0.0.1:18010), then writes Downloads/cookies-export.txt in
 Netscape cookies.txt format. Previous exports are deleted first, so there is
 always exactly one current file (Rehan's rule).
 
+The extension (v1.2.2+) handles tab management internally: it creates ONE
+throwaway background tab, exports, and closes it immediately. This script
+never opens windows, profiles, or leaves tabs behind.
+
 Run daily via Windows Scheduled Task "MuseCookieExport" (04:00).
 """
 import datetime
@@ -15,6 +19,9 @@ import os
 import urllib.request
 
 DAEMON = "http://127.0.0.1:18010/tool"
+# Hard timeout: if the export takes longer than this, abort rather than
+# hanging Rehan's browser (2026-10-04 fix for profile-spam incident).
+EXPORT_TIMEOUT_S = 30
 
 
 def _daemon_token():
@@ -42,7 +49,8 @@ def call_tool(tool, args):
             "Authorization": f"Bearer {_daemon_token()}",
         },
     )
-    with urllib.request.urlopen(req, timeout=180) as r:
+    # 30s hard timeout (2026-10-04): never hang the browser.
+    with urllib.request.urlopen(req, timeout=EXPORT_TIMEOUT_S) as r:
         return json.load(r)
 
 

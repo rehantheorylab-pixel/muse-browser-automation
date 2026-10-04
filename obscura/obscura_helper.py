@@ -71,6 +71,96 @@ KEYMAP = {
     "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34,
 }
 
+# Indexed action snapshot (jev-blueprint §6.5): our own script emitting
+# jev-style action rows {id, role, label, kind, value, rect, node} — the
+# identical schema as the extension's page.snapshot_indexed, so the same
+# shared decision core drives all three tools. Ported from the extension
+# version; invoked via the same return-wrapped arrow-IIFE pattern as
+# snapshot() because Obscura's Runtime.evaluate rejects bare
+# anonymous function(){} statements.
+INDEXED_SNAPSHOT_JS = r'''function () {
+  try {
+    const cache = window.__museIdx || (window.__museIdx = { ids: [], nodes: new Map(), next: 1 });
+    const nodeId = (e) => {
+      let id = cache.ids.indexOf(e);
+      if (id < 0) { id = cache.next++; cache.ids.push(e); }
+      cache.nodes.set(id, e); return id;
+    };
+    const ROLE_OF = (el) => {
+      const t = (el.tagName || '').toLowerCase();
+      const ty = (el.type || '').toLowerCase();
+      const r = (el.getAttribute('role') || '').toLowerCase();
+      if (r) return r;
+      if (t === 'a') return 'link';
+      if (t === 'button') return 'button';
+      if (t === 'select') return 'combobox';
+      if (t === 'textarea') return 'textbox';
+      if (t === 'input') {
+        if (ty === 'checkbox') return 'checkbox';
+        if (ty === 'radio') return 'radiobutton';
+        if (ty === 'submit' || ty === 'button') return 'button';
+        if (ty === 'search') return 'searchbox';
+        if (ty === 'number') return 'spinbutton';
+        return 'textbox';
+      }
+      return 'element';
+    };
+    const NAME_OF = (el) => {
+      const parts = [el.getAttribute('aria-label'), el.title, el.placeholder,
+        (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') ? '' : (el.textContent || ''),
+        el.value || '', el.getAttribute('alt') || ''];
+      return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+    };
+    const rows = [];
+    const sel = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="combobox"], [role="switch"], [onclick], [tabindex]:not([tabindex="-1"])';
+    let n = 0;
+    for (const el of document.querySelectorAll(sel)) {
+      try {
+        const r = el.getBoundingClientRect();
+        if (!r || r.width < 1 || r.height < 1) continue;
+        if (r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth) continue;
+        if (typeof el.checkVisibility === 'function') {
+          if (!el.checkVisibility({ checkVisibilityCSS: true })) continue;
+        }
+        const role = ROLE_OF(el);
+        const label = NAME_OF(el) || role;
+        const rect = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) };
+        const node = nodeId(el);
+        const value = (el.value !== undefined && el.value !== null) ? String(el.value).slice(0, 120) : '';
+        const isFill = ['textbox', 'searchbox', 'spinbutton'].indexOf(role) >= 0;
+        const isSelect = role === 'combobox';
+        if (isFill) {
+          rows.push({ id: ++n, role, label, kind: 'fill', value, rect, node });
+          rows.push({ id: ++n, role, label: 'Open ' + label, kind: 'click', value: '', rect, node });
+        } else if (isSelect) {
+          rows.push({ id: ++n, role, label, kind: 'fill', value, rect, node });
+          const opts = Array.from(el.options || []).map(function(o){ return (o.text || '').trim(); }).filter(Boolean).slice(0, 40);
+          for (const o of opts) rows.push({ id: ++n, role: 'option', label: label + ' -> ' + o, kind: 'select', value: o, rect, node });
+          if (!opts.length) rows.push({ id: ++n, role, label: 'Open ' + label, kind: 'click', value: '', rect, node });
+        } else {
+          rows.push({ id: ++n, role, label, kind: 'click', value, rect, node });
+        }
+        if (n >= 250) break;
+      } catch (_) {}
+    }
+    let text = '';
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const chunks = []; let total = 0; let tnode;
+      while ((tnode = walker.nextNode()) && total < 6000) {
+        const t = (tnode.nodeValue || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        const pel = tnode.parentElement;
+        if (!pel) continue;
+        try { const pr = pel.getBoundingClientRect(); if (pr.bottom < 0 || pr.top > window.innerHeight) continue; } catch (_) { continue; }
+        chunks.push(t); total += t.length + 1;
+      }
+      text = chunks.join(' ').slice(0, 6000);
+    } catch (_) {}
+    return { url: location.href, title: document.title, count: n, rows, text, worker: 'obscura-1.0' };
+  } catch (e) { return { url: location.href, title: document.title, count: 0, rows: [], text: '', error: String(e) }; }
+}'''
+
 
 class ObscuraError(Exception):
     pass
@@ -189,6 +279,27 @@ class ObscuraPage:
         if val is None:
             return {"url": "", "title": "", "count": 0, "elements": [],
                     "error": "snapshot evaluated to null"}
+        return val
+
+    async def snapshot_indexed(self):
+        """jev-style indexed action rows (blueprint §6.5).
+
+        Same schema as the Chrome extension's page.snapshot_indexed:
+        {url, title, count, rows: [{id, role, label, kind, value, rect,
+        node}], text}. The shared decision core in rehan/jev.py consumes
+        all three tools' rows identically ("one brain, three hands").
+        """
+        wrapped = "(async()=>{return (%s)()})()" % INDEXED_SNAPSHOT_JS
+        r = await self._cdp(
+            "Runtime.evaluate",
+            expression=wrapped,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+        val = r["result"]["result"].get("value")
+        if val is None:
+            return {"url": "", "title": "", "count": 0, "rows": [],
+                    "text": "", "error": "snapshot_indexed evaluated to null"}
         return val
 
     async def title(self):

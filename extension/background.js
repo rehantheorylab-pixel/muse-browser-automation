@@ -337,6 +337,104 @@ const SOM_MARK_JS = `function () {
 
 const SOM_CLEAR_JS = `function () { document.querySelectorAll('.muse-som-mark').forEach(n => n.remove()); return true; }`;
 
+/* Indexed action snapshot (jev-blueprint §6.4): our own script emitting
+ * jev-style action rows {id, role, label, kind, value, rect, node} so the
+ * browser lanes consume the SAME indexed-table + JSON-decision protocol
+ * as the desktop lane. Not copied from jev-ultrafast — written against
+ * the schema, for our decision core ("one brain, three hands").
+ *
+ * node: stable per-element int via a WeakMap identity cache (concept from
+ * the blueprint §1.1, our implementation). The executor resolves
+ * node -> live DOM node; the model only ever sees the positional id.
+ * kind: click | fill | select. Editable twins ("Open <label>") and
+ * per-option select rows mirror rehan/jev.py's element_table_rows.
+ */
+const INDEXED_SNAPSHOT_JS = `function () {
+  try {
+    const cache = window.__museIdx ||= { ids: new WeakMap(), nodes: new Map(), next: 1 };
+    for (const [id, e] of cache.nodes) { try { if (!e.isConnected) cache.nodes.delete(id); } catch (_) {} }
+    const nodeId = (e) => {
+      if (!cache.ids.has(e)) cache.ids.set(e, cache.next++);
+      const id = cache.ids.get(e); cache.nodes.set(id, e); return id;
+    };
+    const ROLE_OF = (el) => {
+      const t = (el.tagName || '').toLowerCase();
+      const ty = (el.type || '').toLowerCase();
+      const r = (el.getAttribute('role') || '').toLowerCase();
+      if (r) return r;
+      if (t === 'a') return 'link';
+      if (t === 'button') return 'button';
+      if (t === 'select') return 'combobox';
+      if (t === 'textarea') return 'textbox';
+      if (t === 'input') {
+        if (ty === 'checkbox') return 'checkbox';
+        if (ty === 'radio') return 'radiobutton';
+        if (ty === 'submit' || ty === 'button') return 'button';
+        if (ty === 'search') return 'searchbox';
+        if (ty === 'number') return 'spinbutton';
+        return 'textbox';
+      }
+      return 'element';
+    };
+    const KIND_OF = (role, el) => {
+      if (['textbox', 'searchbox', 'spinbutton'].includes(role)) return 'fill';
+      if (role === 'combobox') return 'select';
+      return 'click';
+    };
+    const NAME_OF = (el) => {
+      const parts = [el.getAttribute('aria-label'), el.title, el.placeholder,
+        (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') ? '' : (el.textContent || ''),
+        el.value || '', el.getAttribute('alt') || ''];
+      return parts.filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().slice(0, 80);
+    };
+    const rows = [];
+    const sel = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="combobox"], [role="switch"], [onclick], [tabindex]:not([tabindex="-1"])';
+    let n = 0;
+    for (const el of document.querySelectorAll(sel)) {
+      try {
+        const r = el.getBoundingClientRect();
+        if (!r || r.width < 1 || r.height < 1) continue;
+        if (r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth) continue;
+        if (typeof el.checkVisibility === 'function') {
+          if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+        }
+        const role = ROLE_OF(el), kind = KIND_OF(role, el);
+        const label = NAME_OF(el) || role;
+        const rect = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) };
+        const node = nodeId(el);
+        const value = (el.value !== undefined && el.value !== null) ? String(el.value).slice(0, 120) : '';
+        if (kind === 'fill') {
+          rows.push({ id: ++n, role, label, kind: 'fill', value, rect, node });
+          rows.push({ id: ++n, role, label: 'Open ' + label, kind: 'click', value: '', rect, node });
+        } else if (kind === 'select') {
+          rows.push({ id: ++n, role, label, kind: 'fill', value, rect, node });
+          const opts = Array.from(el.options || []).map(o => (o.text || '').trim()).filter(Boolean).slice(0, 40);
+          for (const o of opts) rows.push({ id: ++n, role: 'option', label: label + ' -> ' + o, kind: 'select', value: o, rect, node });
+          if (!opts.length) rows.push({ id: ++n, role, label: 'Open ' + label, kind: 'click', value: '', rect, node });
+        } else {
+          rows.push({ id: ++n, role, label, kind: 'click', value, rect, node });
+        }
+        if (n >= 250) break;
+      } catch (_) {}
+    }
+    let text = '';
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const chunks = []; let total = 0; let tnode;
+      while ((tnode = walker.nextNode()) && total < 6000) {
+        const t = (tnode.nodeValue || '').replace(/\\s+/g, ' ').trim();
+        if (!t) continue;
+        const pel = tnode.parentElement;
+        if (!pel) continue;
+        try { const pr = pel.getBoundingClientRect(); if (pr.bottom < 0 || pr.top > window.innerHeight) continue; } catch (_) { continue; }
+        chunks.push(t); total += t.length + 1;
+      }
+      text = chunks.join(' ').slice(0, 6000);
+    } catch (_) {}
+    return { url: location.href, title: document.title, count: n, rows, text, worker: '1.2.0' };
+  } catch (e) { return { url: location.href, title: document.title, count: 0, rows: [], text: '', error: String(e) }; }
+}`;
+
 const KEYMAP = {
   Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
   ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
@@ -553,6 +651,13 @@ async function dispatch(method, p) {
       if (v && typeof v === 'object') { v.worker = '1.1.5'; }
       return v === undefined ? { diag: 'evaluate returned undefined', worker: '1.1.5' } : v;
     }
+    case 'page.snapshot_indexed': {
+      // Blueprint §6.4: jev-style indexed action rows for the shared
+      // decision core. Same reliable wrapping as page.snapshot (v1.1.5).
+      const tabId = await resolveTab(p);
+      const v = await evaluate(tabId, `function(){return (async()=>{return (${INDEXED_SNAPSHOT_JS})()})();}`);
+      return v === undefined ? { diag: 'evaluate returned undefined', worker: '1.2.0' } : v;
+    }
     case 'page.screenshot': {
       const tabId = await resolveTab(p);
       await ensureAttached(tabId);
@@ -633,15 +738,30 @@ async function dispatch(method, p) {
       return { scrolled: { deltaY } };
     }
     case 'cookies.export_cdp': {
-      // COOKIE EXPORT VIA CDP (v1.2.1): reads the full cookie jar through the
+      // COOKIE EXPORT VIA CDP (v1.2.2): reads the full cookie jar through the
       // already-granted debugger permission (Storage.getCookies). No 'cookies'
       // permission, no manifest change, no Chrome restart. The caller
       // (PC-side script via the daemon) writes Downloads/cookies-export.txt.
-      const tabId = await resolveTab(p);
-      await ensureAttached(tabId);
-      const res = await cdp(tabId, 'Storage.getCookies', {});
-      const cookies = (res && res.cookies) || [];
-      return { worker: '1.2.1', count: cookies.length, cookies };
+      //
+      // SELF-CONTAINED (2026-10-04 fix): creates ONE throwaway background tab,
+      // exports, closes it immediately. Never touches Rehan's tabs, never
+      // opens a window or profile. Previous version relied on resolveTab()
+      // which required an existing automation tab and could trigger tab
+      // creation cascades.
+      let tabId = null;
+      try {
+        const t = await chrome.tabs.create({ url: 'about:blank', active: false });
+        tabId = t.id;
+        await ensureAttached(tabId);
+        const res = await cdp(tabId, 'Storage.getCookies', {});
+        const cookies = (res && res.cookies) || [];
+        return { worker: '1.2.2', count: cookies.length, cookies };
+      } finally {
+        if (tabId !== null) {
+          try { await chrome.tabs.remove(tabId); } catch (_) {}
+          if (attachedTabId === tabId) attachedTabId = null;
+        }
+      }
     }
     default:
       throw new Error('unknown method: ' + method);
