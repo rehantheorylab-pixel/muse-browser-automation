@@ -13,7 +13,7 @@ import socket
 import sys
 import threading
 from concurrent.futures import Future as ConcurrentFuture
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import websockets
 
@@ -22,6 +22,21 @@ from _auth import get_or_create_token, is_authorized
 # Ports are overridable per-machine via env (defaults suit the Chrome extension).
 WS_HOST, WS_PORT = "127.0.0.1", int(os.environ.get("MUSE_WS_PORT", 19091))
 HTTP_HOST, HTTP_PORT = "127.0.0.1", int(os.environ.get("MUSE_HTTP_PORT", 18010))
+
+
+def _fix_stdio():
+    """pythonw.exe has no console: sys.stdout/sys.stderr are None and the
+    first print() crashes the daemon instantly. Redirect to a log file so
+    the VBS autostart (which uses pythonw) actually survives login."""
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            logdir = os.path.join(os.path.expanduser("~"), "muse-browser-mcp")
+            os.makedirs(logdir, exist_ok=True)
+            log = open(os.path.join(logdir, "simpled.log"), "a",
+                       buffering=1, encoding="utf-8", errors="replace")
+            sys.stdout = sys.stderr = log
+        except Exception:
+            pass
 
 
 def _check_port_free(host, port, owner_hint):
@@ -76,12 +91,18 @@ async def ws_handler(ws):
         print("[simpled] extension disconnected", flush=True)
 
 
-def call_extension(method, params, timeout=60):
-    """Send a tool call to the extension, wait for result. Thread-safe."""
+def call_extension(method, params, timeout=25):
+    """Send a tool call to the extension, wait for result. Thread-safe.
+
+    Never blocks the HTTP server for long: with ThreadingHTTPServer each
+    /tool call runs on its own thread, and a dead extension peer resolves
+    here within `timeout` seconds instead of hanging the daemon.
+    """
     global seq
     with ext_lock:
         ws = ext_ws
-        if ws is None:
+        cur_loop = loop
+        if ws is None or cur_loop is None:
             return {"ok": False, "error": "extension not connected"}
         seq += 1
         mid = seq
@@ -89,15 +110,22 @@ def call_extension(method, params, timeout=60):
         fut = ConcurrentFuture()
         pending[mid] = fut
         msg = json.dumps({"id": mid, "method": method, "params": params or {}})
-        asyncio.run_coroutine_threadsafe(ws.send(msg), loop)
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(msg), cur_loop)
+        except RuntimeError as e:
+            # event loop closed or shutting down
+            pending.pop(mid, None)
+            return {"ok": False, "error": f"event loop unavailable: {e}"}
     try:
         result = fut.result(timeout=timeout)
     except Exception as e:
         pending.pop(mid, None)
         return {"ok": False, "error": f"timeout/error: {e}"}
-    if result.get("ok"):
+    if isinstance(result, dict) and result.get("ok"):
         return {"ok": True, "result": result.get("result")}
-    return {"ok": False, "error": result.get("error", "unknown")}
+    if isinstance(result, dict):
+        return {"ok": False, "error": result.get("error", "unknown")}
+    return {"ok": False, "error": f"unexpected reply: {result!r}"}
 
 
 # Map HTTP tool names to extension method names
@@ -167,7 +195,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_http():
-    srv = HTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    # ThreadingHTTPServer (not HTTPServer): one stuck /tool call must never
+    # block /health or other calls behind it — that was the "daemon hangs"
+    # failure mode (single-threaded server + 60s extension waits).
+    srv = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    srv.daemon_threads = True
     print(f"[simpled] HTTP on {HTTP_HOST}:{HTTP_PORT}", flush=True)
     srv.serve_forever()
 
@@ -175,12 +207,18 @@ def run_http():
 async def run_ws():
     global loop
     loop = asyncio.get_running_loop()
-    async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
+    # ping keepalive: a silently-dead extension peer used to leave ext_ws
+    # set forever, so every call_extension blocked to timeout. Now dead
+    # peers are dropped and the next call fails fast instead of hanging.
+    async with websockets.serve(
+        ws_handler, WS_HOST, WS_PORT, ping_interval=20, ping_timeout=20
+    ):
         print(f"[simpled] WS on {WS_HOST}:{WS_PORT}", flush=True)
         await asyncio.Future()
 
 
 def main():
+    _fix_stdio()  # must be first: under pythonw there is no console
     _check_port_free(WS_HOST, WS_PORT, "mcp_server.py or another simpled")
     _check_port_free(HTTP_HOST, HTTP_PORT, "mused.py or another simpled")
     get_or_create_token()  # ensure the bearer token exists before serving

@@ -748,10 +748,15 @@ async function dispatch(method, p) {
       // opens a window or profile. Previous version relied on resolveTab()
       // which required an existing automation tab and could trigger tab
       // creation cascades.
+      //
+      // TAB GROUP RULE (Rehan's standing rule, in code not memory): EVERY tab
+      // this extension creates goes into the "Muse automation" group, no
+      // exceptions — even throwaway tabs (grouped then removed).
       let tabId = null;
       try {
         const t = await chrome.tabs.create({ url: 'about:blank', active: false });
         tabId = t.id;
+        await ensureTabInGroup(tabId);
         await ensureAttached(tabId);
         const res = await cdp(tabId, 'Storage.getCookies', {});
         const cookies = (res && res.cookies) || [];

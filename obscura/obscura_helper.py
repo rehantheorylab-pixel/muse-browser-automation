@@ -194,6 +194,30 @@ class ObscuraPage:
         self._msg_id = 0
         self._target_id = None
         self._session_id = None
+        self._own_target = False
+
+    def _find_page_target(self, timeout=5):
+        """Return an existing page target dict from /json/list, or None.
+
+        Connecting straight to a page's webSocketDebuggerUrl avoids
+        Target.createTarget/attachToTarget entirely — more reliable on
+        Obscura's partial CDP implementation.
+        """
+        try:
+            raw = urllib.request.urlopen(
+                "http://%s:%d/json/list" % (CDP_HOST, CDP_PORT),
+                timeout=timeout,
+            ).read().decode()
+            targets = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(targets, list):
+            return None
+        for t in targets:
+            if (isinstance(t, dict) and t.get("type") == "page"
+                    and t.get("webSocketDebuggerUrl")):
+                return t
+        return None
 
     async def __aenter__(self):
         if not is_running():
@@ -202,24 +226,54 @@ class ObscuraPage:
                 'obscura.exe serve --host 127.0.0.1 --port 9222 --stealth '
                 '--storage-dir <profile>' % (CDP_HOST, CDP_PORT)
             )
-        self._ws = await websockets.connect(
-            "ws://%s:%d/devtools/browser" % (CDP_HOST, CDP_PORT)
-        )
-        r = await self._cdp("Target.createTarget", url=self._start_url)
-        self._target_id = r["result"]["targetId"]
-        # flatten=True is REQUIRED — without it there is no sessionId and
-        # every later call fails with "No page for session".
-        r = await self._cdp(
-            "Target.attachToTarget", targetId=self._target_id, flatten=True
-        )
-        self._session_id = r["result"]["sessionId"]
-        await self._cdp("Page.enable")
-        await self._cdp("Runtime.enable")
-        return self
+        last_err = None
+        for attempt in range(3):
+            try:
+                # Path 1 (preferred): attach to an existing page target.
+                target = self._find_page_target()
+                if target:
+                    self._ws = await websockets.connect(
+                        target["webSocketDebuggerUrl"])
+                    self._target_id = target.get("id")
+                    self._session_id = None  # page socket: no session needed
+                    self._own_target = False
+                else:
+                    # Path 2: browser endpoint + create/attach (classic flow).
+                    self._ws = await websockets.connect(
+                        "ws://%s:%d/devtools/browser" % (CDP_HOST, CDP_PORT)
+                    )
+                    r = await self._cdp("Target.createTarget",
+                                        url=self._start_url)
+                    self._target_id = r["result"]["targetId"]
+                    # flatten=True is REQUIRED — without it there is no
+                    # sessionId and every later call fails.
+                    r = await self._cdp("Target.attachToTarget",
+                                        targetId=self._target_id, flatten=True)
+                    self._session_id = r["result"]["sessionId"]
+                    self._own_target = True
+                await self._cdp("Page.enable")
+                await self._cdp("Runtime.enable")
+                return self
+            except Exception as e:
+                last_err = e
+                try:
+                    if self._ws:
+                        await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                self._target_id = None
+                self._session_id = None
+                await asyncio.sleep(1 + attempt)
+        raise ObscuraError(
+            "could not establish Obscura CDP session after 3 attempts: %r"
+            % (last_err,))
 
     async def __aexit__(self, *exc):
         try:
-            if self._target_id:
+            # Only close targets we created — never kill a page the user
+            # (or another tool) already had open.
+            if self._target_id and self._own_target:
                 await self._cdp("Target.closeTarget", targetId=self._target_id)
         except Exception:
             pass
@@ -229,8 +283,16 @@ class ObscuraPage:
         except Exception:
             pass
         self._ws = None
+        self._own_target = False
 
     async def _cdp(self, method, **params):
+        if self._ws is None:
+            # This was the "'NoneType' object has no attribute 'send'"
+            # failure: methods called without 'async with', or after a
+            # failed __aenter__. Say so plainly instead of AttributeError.
+            raise ObscuraError(
+                "not connected to Obscura — use 'async with ObscuraPage():' "
+                "before calling CDP methods")
         self._msg_id += 1
         req = {"id": self._msg_id, "method": method, "params": params}
         if self._session_id:
