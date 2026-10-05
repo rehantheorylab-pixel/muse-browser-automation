@@ -229,28 +229,21 @@ class ObscuraPage:
         last_err = None
         for attempt in range(3):
             try:
-                # Path 1 (preferred): attach to an existing page target.
-                target = self._find_page_target()
-                if target:
-                    self._ws = await websockets.connect(
-                        target["webSocketDebuggerUrl"])
-                    self._target_id = target.get("id")
-                    self._session_id = None  # page socket: no session needed
-                    self._own_target = False
-                else:
-                    # Path 2: browser endpoint + create/attach (classic flow).
-                    self._ws = await websockets.connect(
-                        "ws://%s:%d/devtools/browser" % (CDP_HOST, CDP_PORT)
-                    )
-                    r = await self._cdp("Target.createTarget",
-                                        url=self._start_url)
-                    self._target_id = r["result"]["targetId"]
-                    # flatten=True is REQUIRED — without it there is no
-                    # sessionId and every later call fails.
-                    r = await self._cdp("Target.attachToTarget",
-                                        targetId=self._target_id, flatten=True)
-                    self._session_id = r["result"]["sessionId"]
-                    self._own_target = True
+                # Path 1 (primary): browser endpoint + create/attach. This is
+                # the proven flow — Obscura's page sockets expect the
+                # sessionId from Target.attachToTarget (flatten=True).
+                self._ws = await websockets.connect(
+                    "ws://%s:%d/devtools/browser" % (CDP_HOST, CDP_PORT)
+                )
+                r = await self._cdp("Target.createTarget",
+                                    url=self._start_url)
+                self._target_id = r["result"]["targetId"]
+                # flatten=True is REQUIRED — without it there is no
+                # sessionId and every later call fails.
+                r = await self._cdp("Target.attachToTarget",
+                                    targetId=self._target_id, flatten=True)
+                self._session_id = r["result"]["sessionId"]
+                self._own_target = True
                 await self._cdp("Page.enable")
                 await self._cdp("Runtime.enable")
                 return self
@@ -264,6 +257,28 @@ class ObscuraPage:
                 self._ws = None
                 self._target_id = None
                 self._session_id = None
+                self._own_target = False
+                # Path 2 (fallback): attach to an existing page target via
+                # /json/list. No createTarget/attachToTarget round-trip.
+                try:
+                    target = self._find_page_target()
+                    if target:
+                        self._ws = await websockets.connect(
+                            target["webSocketDebuggerUrl"])
+                        self._target_id = target.get("id")
+                        self._session_id = None
+                        self._own_target = False
+                        await self._cdp("Page.enable")
+                        await self._cdp("Runtime.enable")
+                        return self
+                except Exception as e2:
+                    last_err = e2
+                    try:
+                        if self._ws:
+                            await self._ws.close()
+                    except Exception:
+                        pass
+                    self._ws = None
                 await asyncio.sleep(1 + attempt)
         raise ObscuraError(
             "could not establish Obscura CDP session after 3 attempts: %r"
