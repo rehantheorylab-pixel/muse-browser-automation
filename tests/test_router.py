@@ -385,3 +385,56 @@ def test_execute_action_unknown_action_reports_error():
     )
     assert res.ok is False
     assert "Unknown action" in (res.error or "")
+
+
+# ── patchright lead-engine routing (v2.2) ────────────────────────────────
+
+def test_patchright_preference_unavailable_raises():
+    from core.backends.patchright_backend import PatchrightBackend
+    with mock.patch.object(
+        PatchrightBackend, "is_available", new=mock.AsyncMock(return_value=False)
+    ):
+        r = _router()
+        with pytest.raises(RuntimeError, match="[Pp]atchright"):
+            run(r.resolve_backend(preference="patchright"))
+
+
+def test_patchright_preference_available():
+    from core.backends.patchright_backend import PatchrightBackend
+    with mock.patch.object(
+        PatchrightBackend, "is_available", new=mock.AsyncMock(return_value=True)
+    ):
+        r = _router()
+        b = run(r.resolve_backend(preference="patchright"))
+        assert b.backend_type == BrowserBackendType.PATCHRIGHT
+
+
+def test_stealth_chain_prefers_patchright():
+    from core.backends.patchright_backend import PatchrightBackend
+    with mock.patch.object(
+        PatchrightBackend, "is_available", new=mock.AsyncMock(return_value=True)
+    ):
+        r = _router()
+        b = run(r.resolve_backend(stealth_required=True))
+        assert b.backend_type == BrowserBackendType.PATCHRIGHT
+
+
+def test_stealth_chain_falls_back_when_patchright_missing():
+    from core.backends.patchright_backend import PatchrightBackend
+    obscura = FakeBackend(BrowserBackendType.OBSCURA, available=True, connected=True)
+    with mock.patch.object(
+        PatchrightBackend, "is_available", new=mock.AsyncMock(return_value=False)
+    ):
+        r = _router(obscura=obscura)
+        b = run(r.resolve_backend(stealth_required=True))
+        assert b is obscura
+
+
+def test_cloudflare_chain_prefers_patchright():
+    from core.backends.patchright_backend import PatchrightBackend
+    with mock.patch.object(
+        PatchrightBackend, "is_available", new=mock.AsyncMock(return_value=True)
+    ):
+        r = _router()
+        b = run(r.resolve_backend(cloudflare_required=True))
+        assert b.backend_type == BrowserBackendType.PATCHRIGHT

@@ -13,8 +13,8 @@ tool keeps its pros, and the router avoids their cons.
 | Task need | Router picks | Why |
 |---|---|---|
 | Logged-in personal session | Chrome (personal profile) | Real cookies, extensions, SSO state |
-| Cloudflare / WAF challenge | FlareSolverr → undetected-chromedriver | Challenge solver + patched stealth driver |
-| Max stealth, anti-detect | Obscura / Camoufox / undetected | Fingerprint evasion at different layers |
+| Cloudflare / WAF challenge | patchright → undetected → Obscura/Camoufox | 2026 lead stealth engine first; FlareSolverr solves separately |
+| Max stealth, anti-detect | patchright → Obscura → Camoufox → undetected | Fingerprint evasion at different layers |
 | Raw speed, isolated pages | Playwright / Moli | Fast startup, headless, disposable |
 | Ultra-lightweight fetch | Lightpanda | ~10x lower memory than Chromium |
 | CLI-style single shots | Agent-Browser | No persistent browser needed |
@@ -55,23 +55,23 @@ tool keeps its pros, and the router avoids their cons.
 - **Cons**: Heavier download (fetches its own browser build); Firefox-only rendering quirks.
 - **Use when**: maximum stealth and the JS-layer patches of undetected-chromedriver aren't enough; cross-engine verification.
 
-### 6. undetected-chromedriver (`core/backends/undetected_backend.py`)
+### 6. patchright — LEAD stealth engine (`core/backends/patchright_backend.py`)
+- **Role**: Compile-time AST-patched Playwright (Apache-2.0) — the 2026-recommended lead engine. Removes CDP-level automation tells from the driver itself instead of injecting JS on top.
+- **Pros**: Never calls CDP `Runtime.enable` (the single most-documented automation signal — executes in isolated contexts instead); `Console.enable` leak removed; command-line flag hygiene (`--disable-blink-features=AutomationControlled` added; `--enable-automation` and friends removed); automation globals renamed (no `__playwright__binding__` signatures); init scripts via Playwright Routes; drop-in Playwright replacement; actively maintained, auto-tracks Playwright releases; prefers real installed Chrome over bundled Chromium (genuine GPU/plugin/font stack).
+- **Cons**: Optional dependency (`pip install patchright`); Console API dead; TLS is stock Chromium (browser-consistent — fine).
+- **Use when**: `stealth_required=True` or `cloudflare_required=True` — the router tries patchright first. Anywhere stock Playwright would be flagged.
+
+### 7. undetected-chromedriver (`core/backends/undetected_backend.py`) — legacy fallback
 - **Role**: Stealth Chromium via binary-level patching (Rehan's Tier 2).
 - **Pros**: Real Chrome rendering (unlike Obscura/Moli); strips `navigator.webdriver` and CDP signatures; **off-screen rendering** (`--window-position=-32000,-32000`) instead of `--headless` so WebGL/Canvas/plugin fingerprints stay genuine; random debug port per run (no 9222 scan signature); disposable UUID profiles (no state bleed, auto-cleaned).
-- **Cons**: Still Chromium under the hood — determined fingerprinting can adapt; needs `undetected_chromedriver` + chromedriver binary installed.
-- **Use when**: Cloudflare Turnstile / WAF targets where genuine Chrome rendering is required but the stock driver signature would be flagged. Pairs with FlareSolverr (Tier 3) for full challenge flows.
+- **Cons**: Upstream effectively unmaintained in 2026 (author moved to nodriver); 2026 benchmarks show 0% success against strict Cloudflare configs — CDP-protocol/binary-signature detection bypasses its patches entirely. Kept as a fallback for basic-Selenium-detection sites only; the router now prefers patchright.
+- **Use when**: patchright/Obscura/Camoufox unavailable; legacy flows. Now also applies the `core.stealth` fingerprint bundle + CDP Emulation overrides on start, plus `--disable-blink-features=AutomationControlled` and WebRTC IP-handling policy flags.
 
-### 7. Agent-Browser CLI (`core/backends/agent_browser_backend.py`)
+### 8. Agent-Browser CLI (`core/backends/agent_browser_backend.py`)
 - **Role**: Command-line browser wrapper for AI-agent interaction.
 - **Pros**: No persistent browser process; fast single-command page interaction and semantic snapshots; good fallback.
 - **Cons**: Less control than a live CDP session; not for multi-step interactive flows.
 - **Use when**: one-shot page reads/snapshots where spinning up a full browser is overkill.
-
-### 8. CSI (`core/backends/csi_backend.py`)
-- **Role**: ximing/csi bridge the operator already runs — reuse existing workflows.
-- **Pros**: Zero new setup if CSI is already running; familiar tool surface.
-- **Cons**: Externally managed (the router can't start it); feature surface limited to what CSI exposes.
-- **Use when**: the operator's existing CSI flows; `preference="csi"`.
 
 ### 9. Lightpanda (`core/backends/lightpanda_backend.py`)
 - **Role**: Ultra-lightweight headless JavaScript browser (Zig), CDP on :9223.
@@ -84,6 +84,79 @@ tool keeps its pros, and the router avoids their cons.
 - **Pros**: Zero new setup if CSI already runs; 21-tool surface (tabs, CDP passthrough, cookies); stdlib-only client.
 - **Cons**: Externally managed (router can't start it); tab targeting emulated via URL lookup; auth via `CSI_API_KEY` env.
 - **Use when**: existing CSI workflows; `preference="csi"`.
+
+---
+
+## Anti-Detection Deep Layer (v2.2) — `core/stealth/`
+
+Beyond per-engine patches, v2.2 adds a shared stealth layer applied to the
+Chromium-family backends. Research synthesis (Oct 2026): Camoufox, Chameleon,
+Brave, invisible_playwright, patchright, rebrowser.
+
+### Fingerprint protection (`core/stealth/fingerprint.py`)
+- **Seeded per-profile identity** (`FingerprintProfile`): one seed derives a
+  coherent UA/platform/WebGL/GPU/fonts/timezone/locale/screen. Stable across
+  sessions of the same profile, distinct across profiles. Never per-call
+  randomness (fails a 4-line double-read check and reads as tampering).
+- **JS injection bundle** via `Page.addScriptToEvaluateOnNewDocument`
+  (before any page script), with Worker re-injection for blob workers:
+  - **Canvas**: position-derived seeded LSB noise on `getImageData`;
+    skips small buffers and few-color images (reference-probe guards).
+  - **WebGL**: vendor/renderer spoof (e.g. `ANGLE (NVIDIA, ... RTX 3060 ...)`)
+    via numeric `getParameter` constants; `WEBGL_debug_renderer_info`
+    hidden; every wrapper keeps `[native code]` toString camouflage
+    (Cloudflare Turnstile checks this literally).
+  - **WebRTC**: `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`
+    launch flag + JS suppression of host/srflx ICE candidates (relay kept).
+  - **Navigator**: coherent getters (`webdriver:false`, platform, languages,
+    hardwareConcurrency, deviceMemory, maxTouchPoints, realistic plugins).
+  - **WebGPU**: adapter descriptors hidden (1,095 measured signatures otherwise).
+  - **Fonts**: bounded ±0.1px `measureText` offset; Local Font Access denied.
+  - **Audio**: scalar spoofing only (sampleRate 48000, pinned baseLatency) —
+    blanket buffer noise is OFF by default (measured 10x tampering increase).
+- **CDP Emulation overrides** (below-JS, nothing to toString-check): UA +
+  full `userAgentMetadata`, timezone, device metrics — from the SAME
+  profile object, so values cohere.
+- **Self-test harness**: `self_test_checks()` lists the gates a profile must
+  pass (double-read, solid-fill, silence, tostring, worker-diff).
+
+### Behavioral evasion (`core/stealth/behavior.py`)
+All events go through CDP `Input.*` (`isTrusted:true`); the *fields* and
+*timing* are humanized (seeded RNG, reproducible):
+- **Mouse**: cubic Bezier with jittered control points, Fitts's-law duration,
+  bell velocity profile, overshoot-and-settle on long moves, 60–300ms
+  pre-click hesitation, off-center click point, correct `pressure`/`buttons`/
+  `movementX/Y` fields, irregular timestamps.
+- **Scroll**: notch bursts (8–120ms gaps), flick + momentum tail, lognormal
+  reading pauses (0.8–4s), occasional reverse micro-scrolls — via CDP
+  `mouseWheel`, never `window.scrollBy` loops.
+- **Typing**: lognormal flight times (40–150ms), digraph speedup, 2–5%
+  typo + backspace corrections, ~28ms per-key floor, via
+  `Input.dispatchKeyEvent` (never `insertText`).
+- **Cadence**: Gaussian gaps between actions (never fixed intervals).
+
+### TLS / network layer (`core/stealth/tls_client.py`)
+- Tier-1 direct HTTP goes through **curl_cffi** (MIT, `impersonate="chrome"`
+  rolling alias): genuine Chrome JA4, HTTP/2 SETTINGS/pseudo-header order,
+  per-request-type header ordering, per-cookie `cookie` headers.
+- Browser-driven (CDP) traffic already has genuine TLS — untouched.
+- Rules: keep UA/TLS consistent; pin `impersonate_os="windows"` to match the
+  real egress stack; refresh aliases regularly (a ~6-month-stale pinned
+  fingerprint gets blocked identically across libraries).
+- **Residuals** (documented, not fixable from JS/CDP): JA4/TLS for non-browser
+  paths without curl_cffi, TCP/IP OS fingerprinting (kernel-level), real-GPU
+  rasterization differences (need C++ engine patches).
+
+### What changed vs v2.1 (why this is "very, very good" now)
+| Before (v2.1) | After (v2.2) |
+|---|---|
+| undetected-chromedriver = lead engine (0% vs strict CF in 2026) | **patchright** = lead engine (AST-patched driver, active) |
+| Fingerprint = binary patching only | Seeded JS bundle + CDP Emulation + probe guards + toString masking |
+| Mouse = Playwright click (teleport) | Bezier + Fitts + hesitation via CDP trusted events |
+| Typing = `insertText` | Keystroke dynamics via `dispatchKeyEvent` |
+| Scroll = fixed-step loops | Notch bursts + momentum + reading pauses |
+| TLS = documented caveat | curl_cffi Chrome impersonation for Tier-1 |
+| FlareSolverr = primary CF path | Demoted (documented Turnstile timeouts); patchright leads |
 
 ---
 

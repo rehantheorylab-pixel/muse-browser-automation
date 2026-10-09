@@ -55,7 +55,13 @@ def _build_stealth_driver_with_port(
     """Build the stealth driver and also report the DevTools port.
 
     The driver construction below is exactly Rehan's spec (off-screen,
-    NOT headless; disposable ``prof_<uuid>`` profile dir).
+    NOT headless; disposable ``prof_<uuid>`` profile dir) plus 2026
+    flag hygiene from the stealth research:
+      - --disable-blink-features=AutomationControlled (hides the
+        AutomationControlled blink feature)
+      - --force-webrtc-ip-handling-policy=disable_non_proxied_udp
+        (WebRTC IP leak prevention; mDNS obfuscation stays default-on)
+    uc itself strips navigator.webdriver and the $cdc_ CDP signatures.
     """
     import undetected_chromedriver as uc
 
@@ -68,6 +74,12 @@ def _build_stealth_driver_with_port(
     options.add_argument("--window-position=-32000,-32000")  # off-screen, NOT headless
     options.add_argument("--window-size=1280,800")
     options.add_argument("--password-store=basic")
+    # 2026 flag hygiene: hide AutomationControlled blink feature, and
+    # stop WebRTC from leaking non-proxied UDP (host/srflx candidates).
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+    )
     driver = uc.Chrome(options=options)
     return driver, profile_path, debug_port
 
@@ -91,15 +103,32 @@ class UndetectedBackend(PlaywrightBackend):
 
     All tab/page/cookie methods are inherited from :class:`PlaywrightBackend`
     and operate on the attached Playwright page objects.
+
+    Anti-detection layers applied on ``start()`` (2026 research):
+      1. Fingerprint JS bundle (``core.stealth.fingerprint``) injected via
+         ``context.add_init_script`` — seeded canvas noise with probe
+         guards, WebGL spoof, WebRTC candidate filtering, navigator
+         coherence, WebGPU hiding, font/audio scalar spoofing, Worker
+         re-injection. Every hook keeps [native code] toString camouflage.
+      2. CDP Emulation overrides (below-JS): UA + metadata, timezone,
+         device metrics — from the same coherent FingerprintProfile.
     """
 
-    def __init__(self, base_profile_dir: Optional[str] = None):
+    def __init__(
+        self,
+        base_profile_dir: Optional[str] = None,
+        stealth_seed: Optional[str] = None,
+        fingerprint: bool = True,
+    ):
         # headless=False: uc Chrome runs headed but off-screen by design.
         super().__init__(headless=False)
         self._base_profile_dir = base_profile_dir or default_stealth_profile_root()
         self._driver: Optional[Any] = None
         self._profile_path: Optional[str] = None
         self._debug_port: Optional[int] = None
+        self._stealth_seed = stealth_seed or uuid.uuid4().hex
+        self._fingerprint_enabled = fingerprint
+        self._fingerprint_profile: Optional[Any] = None
 
     @property
     def backend_type(self) -> BrowserBackendType:
@@ -203,6 +232,10 @@ class UndetectedBackend(PlaywrightBackend):
             else await self._browser.new_context()
         )
 
+        # Anti-detection layer: coherent fingerprint profile + injection.
+        if self._fingerprint_enabled:
+            await self._apply_stealth_profile()
+
         pages = self._context.pages
         page = pages[0] if pages else await self._context.new_page()
 
@@ -210,6 +243,60 @@ class UndetectedBackend(PlaywrightBackend):
         tid = f"uc_{self._page_counter}"
         self._pages[tid] = page
         self._active_tab_id = tid
+
+    async def _apply_stealth_profile(self) -> None:
+        """Build a FingerprintProfile and apply it via CDP + init script.
+
+        CDP Emulation overrides run below-JS (no toString surface);
+        the JS bundle covers canvas/WebGL/WebRTC/fonts/audio/navigator.
+        Both derive from the SAME profile object, so values cohere.
+        Failures are logged, never fatal (graceful degradation).
+        """
+        try:
+            from core.stealth.fingerprint import (
+                FingerprintProfile,
+                build_injection_js,
+            )
+        except Exception as e:
+            logger.warning("stealth fingerprint module unavailable: %s", e)
+            return
+
+        try:
+            profile = FingerprintProfile(seed=self._stealth_seed)
+            self._fingerprint_profile = profile
+
+            # 1. Init script for every new document (runs before page JS).
+            js = build_injection_js(profile)
+            await self._context.add_init_script(js)
+
+            # 2. CDP Emulation overrides (below-JS).
+            pages = self._context.pages
+            if pages:
+                cdp = await self._context.new_cdp_session(pages[0])
+                try:
+                    ov = profile.cdp_emulation_overrides()
+                    await cdp.send(
+                        "Emulation.setUserAgentOverride", ov["user_agent"]
+                    )
+                    await cdp.send(
+                        "Emulation.setTimezoneOverride", ov["timezone"]
+                    )
+                    await cdp.send(
+                        "Emulation.setDeviceMetricsOverride",
+                        ov["device_metrics"],
+                    )
+                finally:
+                    try:
+                        await cdp.detach()
+                    except Exception:
+                        pass
+            logger.info(
+                "stealth profile applied: preset=%s noise_seed=%d",
+                profile.to_dict()["preset"],
+                profile.noise_seed,
+            )
+        except Exception as e:
+            logger.warning("applying stealth profile failed: %s", e)
 
     async def _teardown_driver_only(self) -> None:
         """Quit the uc driver and delete the disposable profile (no PW state)."""

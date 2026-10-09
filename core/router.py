@@ -79,16 +79,23 @@ class BrowserRouter:
     ) -> BaseBrowserBackend:
         """Select backend using availability, performance, and task requirements.
 
-        Routing tiers (Rehan's 3-tier architecture):
-          cloudflare_required -> FlareSolverr solve, then undetected-chromedriver
-                                 (fallback: Obscura, Camoufox)
+        Routing tiers (Rehan's 3-tier architecture + 2026 stealth research):
+          cloudflare_required -> patchright (lead engine, 2026) ->
+                                 undetected-chromedriver -> Obscura -> Camoufox
+                                 (FlareSolverr solves the challenge separately
+                                 via core.cloudflare; demoted — documented
+                                 Turnstile timeouts)
           session_required    -> Chrome personal profile
-          stealth_required    -> Obscura (connected) -> Camoufox -> undetected
+          stealth_required    -> patchright -> Obscura -> Camoufox -> undetected
           default (speed)     -> Playwright -> Moli -> Chrome -> Obscura
         """
         pref = preference.lower()
 
         # Explicit override
+        if pref == "patchright":
+            return await self._lazy_backend(
+                BrowserBackendType.PATCHRIGHT, "patchright_backend", "PatchrightBackend")
+
         if pref == "undetected":
             return await self._lazy_backend(
                 BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend")
@@ -149,12 +156,14 @@ class BrowserRouter:
             self._active_backend = b
             return b
 
-        # Intelligent 'auto' routing (Rehan's 3-tier architecture)
-        # Tier 3+2: Cloudflare/WAF challenge -> undetected-chromedriver first
-        # (FlareSolverr solves the challenge separately via core.cloudflare),
-        # then Obscura, then Camoufox.
+        # Intelligent 'auto' routing (Rehan's 3-tier architecture + 2026 research)
+        # Tier 3+2: Cloudflare/WAF challenge -> patchright first (lead 2026
+        # engine), then undetected-chromedriver, Obscura, Camoufox.
+        # (FlareSolverr solves the challenge separately via core.cloudflare;
+        # demoted after documented Turnstile timeout failures, July 2026.)
         if cloudflare_required:
             for btype, module, cls in (
+                (BrowserBackendType.PATCHRIGHT, "patchright_backend", "PatchrightBackend"),
                 (BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend"),
                 (BrowserBackendType.OBSCURA, None, None),
                 (BrowserBackendType.CAMOUFOX, "camoufox_backend", "CamoufoxBackend"),
@@ -170,7 +179,7 @@ class BrowserRouter:
                     return b
                 except RuntimeError:
                     continue
-            raise RuntimeError("No Cloudflare-capable backend available (need undetected-chromedriver, Obscura, or Camoufox).")
+            raise RuntimeError("No Cloudflare-capable backend available (need patchright, undetected-chromedriver, Obscura, or Camoufox).")
 
         # 1. Personal session requirement -> Chrome
         if session_required:
@@ -179,9 +188,11 @@ class BrowserRouter:
                 self._active_backend = chrome
                 return chrome
 
-        # 2. Stealth anti-detect requirement -> Obscura -> Camoufox -> undetected
+        # 2. Stealth anti-detect requirement ->
+        #    patchright (2026 lead) -> Obscura -> Camoufox -> undetected
         if stealth_required:
             for btype, module, cls in (
+                (BrowserBackendType.PATCHRIGHT, "patchright_backend", "PatchrightBackend"),
                 (BrowserBackendType.OBSCURA, None, None),
                 (BrowserBackendType.CAMOUFOX, "camoufox_backend", "CamoufoxBackend"),
                 (BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend"),

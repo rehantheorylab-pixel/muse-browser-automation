@@ -19,6 +19,7 @@ class BrowserBackendType(str, Enum):
     CSI = "csi"
     LIGHTPANDA = "lightpanda"
     UNDETECTED = "undetected"
+    PATCHRIGHT = "patchright"
 
 
 class ResolutionMethod(str, Enum):

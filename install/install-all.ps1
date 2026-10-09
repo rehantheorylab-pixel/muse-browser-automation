@@ -193,9 +193,9 @@ WshShell.Run """pythonw.exe"" """ & AgentPath & """", 0, False
 }
 
 # ================================================================ 3. python deps
-Write-Step '3. Python dependencies (websockets, pyautogui, playwright, camoufox, undetected-chromedriver)'
-foreach ($pkg in @('websockets', 'pyautogui', 'playwright', 'camoufox', 'undetected-chromedriver')) {
-  $mod = @{ websockets = 'websockets'; pyautogui = 'pyautogui'; playwright = 'playwright'; camoufox = 'camoufox'; 'undetected-chromedriver' = 'undetected_chromedriver' }[$pkg]
+Write-Step '3. Python dependencies (websockets, pyautogui, playwright, patchright, curl_cffi, camoufox, undetected-chromedriver)'
+foreach ($pkg in @('websockets', 'pyautogui', 'playwright', 'patchright', 'curl_cffi', 'camoufox', 'undetected-chromedriver')) {
+  $mod = @{ websockets = 'websockets'; pyautogui = 'pyautogui'; playwright = 'playwright'; patchright = 'patchright'; curl_cffi = 'curl_cffi'; camoufox = 'camoufox'; 'undetected-chromedriver' = 'undetected_chromedriver' }[$pkg]
   $have = $false
   try { & python -c "import $mod" 2>$null; $have = ($LASTEXITCODE -eq 0) } catch { }
   if ($have) { Write-Ok "$pkg already installed"; continue }
