@@ -10,7 +10,11 @@ from core.types import BrowserBackendType
 
 class MoliBackend(PlaywrightBackend):
     """Adapter driving the Moli rust engine via Playwright connect_over_cdp."""
-    
+
+    @property
+    def backend_type(self) -> BrowserBackendType:
+        return BrowserBackendType.MOLI
+
     def __init__(self, headless: bool = True):
         super().__init__(headless)
         self.port = 9226

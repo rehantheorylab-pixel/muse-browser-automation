@@ -6,7 +6,9 @@ from core.types import BrowserBackendType
 class CamoufoxBackend(PlaywrightBackend):
     """Adapter driving the Camoufox anti-detect browser via Playwright."""
     
-    # We can override backend_type if we added CAMOUFOX to BrowserBackendType, but PLAYWRIGHT works fine for type-checking.
+    @property
+    def backend_type(self) -> BrowserBackendType:
+        return BrowserBackendType.CAMOUFOX
 
     async def is_available(self) -> bool:
         try:

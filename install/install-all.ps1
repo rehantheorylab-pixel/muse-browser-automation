@@ -5,9 +5,10 @@
 .DESCRIPTION
   Paste ONE command from the README into PowerShell and this script does
   everything: prerequisites, browser engines (Moli, Camoufox, Playwright,
-  Obscura, Agent-Browser), the Chrome extension, the loopback daemons,
-  ngrok public URL, and the daily cookie-export task. Idempotent — safe
-  to re-run; it skips anything already installed or running.
+  Obscura, Agent-Browser, undetected-chromedriver), FlareSolverr challenge
+  solver, the Chrome extension, the loopback daemons, ngrok public URL,
+  and the daily cookie-export task. Idempotent — safe to re-run; it skips
+  anything already installed or running.
 
   ONE-LINE INSTALL (fill in the published URL in the README):
     powershell -ExecutionPolicy Bypass -c "irm <INSTALLER-URL> | iex"
@@ -192,9 +193,9 @@ WshShell.Run """pythonw.exe"" """ & AgentPath & """", 0, False
 }
 
 # ================================================================ 3. python deps
-Write-Step '3. Python dependencies (websockets, pyautogui, playwright, camoufox)'
-foreach ($pkg in @('websockets', 'pyautogui', 'playwright', 'camoufox')) {
-  $mod = @{ websockets = 'websockets'; pyautogui = 'pyautogui'; playwright = 'playwright'; camoufox = 'camoufox' }[$pkg]
+Write-Step '3. Python dependencies (websockets, pyautogui, playwright, camoufox, undetected-chromedriver)'
+foreach ($pkg in @('websockets', 'pyautogui', 'playwright', 'camoufox', 'undetected-chromedriver')) {
+  $mod = @{ websockets = 'websockets'; pyautogui = 'pyautogui'; playwright = 'playwright'; camoufox = 'camoufox'; 'undetected-chromedriver' = 'undetected_chromedriver' }[$pkg]
   $have = $false
   try { & python -c "import $mod" 2>$null; $have = ($LASTEXITCODE -eq 0) } catch { }
   if ($have) { Write-Ok "$pkg already installed"; continue }
@@ -315,6 +316,30 @@ try {
     else { Write-Warn 'agent-browser not available via npm — skipped.' }
   } else { Write-Info 'agent-browser not found and npm is missing — skipped (optional).' }
 } catch { Write-Warn "agent-browser step failed: $($_.Exception.Message)" }
+
+# ================================================================ 6b. FlareSolverr (Cloudflare challenge solver, :8191)
+Write-Step '6b. FlareSolverr (Cloudflare challenge solver on 127.0.0.1:8191)'
+$FlarePort = 8191
+try {
+  if (Test-HttpOk "http://127.0.0.1:$FlarePort/") { Write-Ok "FlareSolverr already serving on 127.0.0.1:$FlarePort" }
+  elseif (Get-Command docker -ErrorAction SilentlyContinue) {
+    Write-Info 'Starting FlareSolverr via Docker (ghcr.io/flaresolverr/flaresolverr:latest) ...'
+    $existing = & docker ps -a --filter "name=flaresolverr" --format "{{.Names}}" 2>$null
+    if ($existing -notcontains 'flaresolverr') {
+      & docker run -d --name flaresolverr -p "$FlarePort`:8191" --restart unless-stopped ghcr.io/flaresolverr/flaresolverr:latest 2>&1 | Out-Null
+    } else {
+      & docker start flaresolverr 2>&1 | Out-Null
+    }
+    Start-Sleep -Seconds 8
+    if (Test-HttpOk "http://127.0.0.1:$FlarePort/") { Write-Ok "FlareSolverr serving on 127.0.0.1:$FlarePort" }
+    else { Write-Warn 'FlareSolverr container started but not answering yet — check `docker logs flaresolverr`.' }
+    $global:Summary['FlareSolverr'] = "http://127.0.0.1:$FlarePort/v1"
+  } else {
+    Write-Warn 'Docker not found — FlareSolverr skipped. Install Docker Desktop and re-run, or:'
+    Write-Info '  docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest'
+    $global:Summary['FlareSolverr'] = 'SKIPPED (needs Docker)'
+  }
+} catch { Write-Warn "FlareSolverr step failed: $($_.Exception.Message)" }
 
 # ================================================================ 7. Chrome extension
 Write-Step '7. Chrome extension (Muse Browser Control)'

@@ -16,6 +16,9 @@ class BrowserBackendType(str, Enum):
     CAMOUFOX = "camoufox"
     MOLI = "moli"
     AGENT_BROWSER = "agent-browser"
+    CSI = "csi"
+    LIGHTPANDA = "lightpanda"
+    UNDETECTED = "undetected"
 
 
 class ResolutionMethod(str, Enum):

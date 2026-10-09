@@ -15,7 +15,7 @@ That's it. The installer downloads everything, sets up all engines, and prints a
 
 ## What this is
 
-The merged "best of both" repo: the 7-engine browser framework (a friend's multi-engine design) combined with Rehan's research stack (custom Chrome extension, cookie sync, PC Agent). One smart router picks the best browser engine per task — you just say what to do.
+The merged "best of both" repo: the multi-engine browser framework (a friend's design) combined with Rehan's research stack (custom Chrome extension, cookie sync, PC Agent, anti-detection architecture). One smart router picks the best browser engine per task — you just say what to do.
 
 ## The engines
 
@@ -25,24 +25,27 @@ The merged "best of both" repo: the 7-engine browser framework (a friend's multi
 | Playwright | Fast headless scraping, tests, DOM work | — |
 | Moli | Speed + AI-optimized control lane | 9226 |
 | Obscura | Stealth — bot-defended sites (Cloudflare, Datadome, Akamai) | 9222 |
-| Camoufox | Anti-detect — fingerprint evasion at the browser level | — |
+| Camoufox | Anti-detect — fingerprint evasion at the C++ level | — |
+| undetected-chromedriver | Stealth Chrome — patched driver, off-screen rendering, random debug port, disposable profiles | dynamic |
 | Agent-Browser | Quick CLI-style page checks, fallback snapshots | — |
-| CSI | Fast background snapshots (no focus steal) | — |
-| Lightpanda | Ultra-lightweight JS pages, low memory | — |
+| CSI | Existing ximing/csi workflows (externally managed daemon) | 10088 |
+| Lightpanda | Ultra-lightweight JS pages, low memory | 9223 |
 
 Plus **PC Agent** (port 18011): Windows mouse/keyboard via SendInput — for anything outside the browser.
+Plus **FlareSolverr** (port 8191): Cloudflare challenge solver — extracts `cf_clearance` + User-Agent (see `core/cloudflare/`).
 
 ## Smart router
 
-`core/router.py` picks the engine automatically:
+`core/router.py` picks the engine automatically (Rehan's 3-tier architecture):
 
-1. **Logged-in session needed?** → Chrome (personal profile, your cookies).
-2. **Bot protection on the target?** → Obscura, then Camoufox.
-3. **Raw speed, no JS weight?** → Lightpanda or Playwright headless.
-4. **Need a JSON decision fast?** → jev ultrafast lane.
-5. **Fallback:** Agent-Browser for simple snapshot reads.
+1. **Cloudflare/WAF challenge?** (`cloudflare_required=True`) → undetected-chromedriver → Obscura → Camoufox. (FlareSolverr solves separately via `core/cloudflare`.)
+2. **Logged-in session needed?** (`session_required=True`) → Chrome (personal profile, your cookies).
+3. **Stealth / anti-detect?** (`stealth_required=True`) → Obscura → Camoufox → undetected-chromedriver.
+4. **Raw speed?** → Playwright → Moli → Chrome → Obscura.
+5. **Need a JSON decision fast?** → jev ultrafast lane.
+6. **Fallback:** Agent-Browser for simple snapshot reads.
 
-Override any pick with `--engine <name>`. Unavailable engine → router raises immediately, no silent fallback.
+Override any pick with `--engine <name>` (`chrome`, `playwright`, `moli`, `obscura`, `camoufox`, `undetected`, `agent-browser`, `csi`, `lightpanda`). Unavailable engine → router raises immediately, no silent fallback.
 
 ## Rehan's research
 

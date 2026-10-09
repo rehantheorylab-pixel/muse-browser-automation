@@ -50,17 +50,57 @@ class BrowserRouter:
         status["active_backend"] = self._active_backend.backend_type.value if self._active_backend else "none"
         return status
 
+    async def _lazy_backend(self, btype: BrowserBackendType, module: str, cls: str) -> BaseBrowserBackend:
+        """Lazily import and register a backend, then return it (raises if unavailable)."""
+        if btype not in self.backends:
+            mod = __import__(f"core.backends.{module}", fromlist=[cls])
+            self.backends[btype] = getattr(mod, cls)()
+        b = self.backends[btype]
+        if not await b.is_available():
+            raise RuntimeError(f"{btype.value} backend is not available on this system.")
+        self._active_backend = b
+        return b
+
+    def flaresolverr_available(self) -> bool:
+        """Check whether the FlareSolverr challenge solver is reachable (Tier 3)."""
+        try:
+            from core.cloudflare import FlareSolverrClient
+            return FlareSolverrClient().is_available()
+        except Exception:
+            return False
+
     async def resolve_backend(
         self,
         preference: str = "auto",
         intent: Optional[str] = None,
         session_required: bool = False,
         stealth_required: bool = False,
+        cloudflare_required: bool = False,
     ) -> BaseBrowserBackend:
-        """Select backend using availability, performance, and task requirements."""
+        """Select backend using availability, performance, and task requirements.
+
+        Routing tiers (Rehan's 3-tier architecture):
+          cloudflare_required -> FlareSolverr solve, then undetected-chromedriver
+                                 (fallback: Obscura, Camoufox)
+          session_required    -> Chrome personal profile
+          stealth_required    -> Obscura (connected) -> Camoufox -> undetected
+          default (speed)     -> Playwright -> Moli -> Chrome -> Obscura
+        """
         pref = preference.lower()
 
         # Explicit override
+        if pref == "undetected":
+            return await self._lazy_backend(
+                BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend")
+
+        if pref == "csi":
+            return await self._lazy_backend(
+                BrowserBackendType.CSI, "csi_backend", "CSIBackend")
+
+        if pref == "lightpanda":
+            return await self._lazy_backend(
+                BrowserBackendType.LIGHTPANDA, "lightpanda_backend", "LightpandaBackend")
+
         if pref == "moli":
             if BrowserBackendType.MOLI not in self.backends:
                 from core.backends.moli_backend import MoliBackend
@@ -88,7 +128,7 @@ class BrowserRouter:
             self._active_backend = b
             return b
 
-        if pref in ("chrome", "csi", BrowserBackendType.CHROME.value):
+        if pref in ("chrome", BrowserBackendType.CHROME.value):
             b = self.backends[BrowserBackendType.CHROME]
             if not await b.is_available():
                 raise RuntimeError("Requested Chrome backend is not available on this system.")
@@ -109,7 +149,29 @@ class BrowserRouter:
             self._active_backend = b
             return b
 
-        # Intelligent 'auto' routing
+        # Intelligent 'auto' routing (Rehan's 3-tier architecture)
+        # Tier 3+2: Cloudflare/WAF challenge -> undetected-chromedriver first
+        # (FlareSolverr solves the challenge separately via core.cloudflare),
+        # then Obscura, then Camoufox.
+        if cloudflare_required:
+            for btype, module, cls in (
+                (BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend"),
+                (BrowserBackendType.OBSCURA, None, None),
+                (BrowserBackendType.CAMOUFOX, "camoufox_backend", "CamoufoxBackend"),
+            ):
+                try:
+                    if module:
+                        b = await self._lazy_backend(btype, module, cls)
+                    else:
+                        b = self.backends[btype]
+                        if not await b.is_available():
+                            continue
+                        self._active_backend = b
+                    return b
+                except RuntimeError:
+                    continue
+            raise RuntimeError("No Cloudflare-capable backend available (need undetected-chromedriver, Obscura, or Camoufox).")
+
         # 1. Personal session requirement -> Chrome
         if session_required:
             chrome = self.backends[BrowserBackendType.CHROME]
@@ -117,12 +179,22 @@ class BrowserRouter:
                 self._active_backend = chrome
                 return chrome
 
-        # 2. Stealth anti-detect requirement -> Obscura
+        # 2. Stealth anti-detect requirement -> Obscura -> Camoufox -> undetected
         if stealth_required:
-            obscura = self.backends[BrowserBackendType.OBSCURA]
-            if await obscura.is_connected():
-                self._active_backend = obscura
-                return obscura
+            for btype, module, cls in (
+                (BrowserBackendType.OBSCURA, None, None),
+                (BrowserBackendType.CAMOUFOX, "camoufox_backend", "CamoufoxBackend"),
+                (BrowserBackendType.UNDETECTED, "undetected_backend", "UndetectedBackend"),
+            ):
+                try:
+                    if module:
+                        return await self._lazy_backend(btype, module, cls)
+                    b = self.backends[btype]
+                    if await b.is_connected():
+                        self._active_backend = b
+                        return b
+                except RuntimeError:
+                    continue
 
         # 3. Default fast path: Playwright (if installed) for isolated headless speed
         pw = self.backends[BrowserBackendType.PLAYWRIGHT]

@@ -187,10 +187,79 @@ def test_explicit_chrome_preference():
     assert b.backend_type == BrowserBackendType.CHROME
 
 
-def test_explicit_csi_alias_maps_to_chrome():
+def test_explicit_csi_preference_uses_dedicated_backend():
+    # "csi" now resolves to the dedicated CSIBackend (lazy import), not Chrome.
+    from core.backends.csi_backend import CSIBackend
     r = _router()
-    b = run(r.resolve_backend(preference="csi"))
-    assert b.backend_type == BrowserBackendType.CHROME
+    with mock.patch.object(CSIBackend, "is_available", return_value=True):
+        b = run(r.resolve_backend(preference="csi"))
+    assert b.backend_type == BrowserBackendType.CSI
+
+
+def test_explicit_undetected_preference():
+    from core.backends.undetected_backend import UndetectedBackend
+    r = _router()
+    with mock.patch.object(UndetectedBackend, "is_available", return_value=True):
+        b = run(r.resolve_backend(preference="undetected"))
+    assert b.backend_type == BrowserBackendType.UNDETECTED
+
+
+def test_explicit_lightpanda_preference():
+    from core.backends.lightpanda_backend import LightpandaBackend
+    r = _router()
+    with mock.patch.object(LightpandaBackend, "is_available", return_value=True):
+        b = run(r.resolve_backend(preference="lightpanda"))
+    assert b.backend_type == BrowserBackendType.LIGHTPANDA
+
+
+def test_cloudflare_required_routes_to_undetected_first():
+    from core.backends.undetected_backend import UndetectedBackend
+    r = _router()
+    with mock.patch.object(UndetectedBackend, "is_available", return_value=True):
+        b = run(r.resolve_backend(cloudflare_required=True))
+    assert b.backend_type == BrowserBackendType.UNDETECTED
+
+
+def test_cloudflare_required_falls_back_to_obscura():
+    from core.backends.undetected_backend import UndetectedBackend
+    r = _router(
+        obscura=FakeBackend(BrowserBackendType.OBSCURA, available=True, connected=True),
+    )
+    with mock.patch.object(UndetectedBackend, "is_available", return_value=False):
+        b = run(r.resolve_backend(cloudflare_required=True))
+    assert b.backend_type == BrowserBackendType.OBSCURA
+
+
+def test_cloudflare_required_all_down_raises():
+    from core.backends.undetected_backend import UndetectedBackend
+    from core.backends.camoufox_backend import CamoufoxBackend
+    r = _router(
+        obscura=FakeBackend(BrowserBackendType.OBSCURA, available=False),
+    )
+    with mock.patch.object(UndetectedBackend, "is_available", return_value=False), \
+         mock.patch.object(CamoufoxBackend, "is_available", return_value=False):
+        with pytest.raises(RuntimeError, match="[Cc]loudflare"):
+            run(r.resolve_backend(cloudflare_required=True))
+
+
+def test_stealth_required_falls_back_to_camoufox_then_undetected():
+    from core.backends.camoufox_backend import CamoufoxBackend
+    from core.backends.undetected_backend import UndetectedBackend
+    r = _router(
+        obscura=FakeBackend(BrowserBackendType.OBSCURA, available=True, connected=False),
+    )
+    with mock.patch.object(CamoufoxBackend, "is_available", return_value=True):
+        b = run(r.resolve_backend(stealth_required=True))
+    assert b.backend_type == BrowserBackendType.CAMOUFOX
+
+
+def test_flaresolverr_available_helper():
+    r = _router()
+    with mock.patch("core.cloudflare.FlareSolverrClient") as cls:
+        cls.return_value.is_available.return_value = True
+        assert r.flaresolverr_available() is True
+        cls.return_value.is_available.return_value = False
+        assert r.flaresolverr_available() is False
 
 
 def test_explicit_preference_unavailable_raises():

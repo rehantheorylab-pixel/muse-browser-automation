@@ -93,11 +93,15 @@ def test_backend_type_is_valid_enum_member():
     }
     for cls, want in expected.items():
         assert cls().backend_type == want, cls.__name__
-    # Moli/Camoufox/AgentBrowser subclass PlaywrightBackend and inherit
-    # its backend_type (PLAYWRIGHT) — documents the current quirk: the
-    # router keys them by their registration type instead.
-    for cls in (MoliBackend, CamoufoxBackend, AgentBrowserBackend):
-        assert cls().backend_type == BrowserBackendType.PLAYWRIGHT, cls.__name__
+    # Moli/Camoufox/AgentBrowser subclass PlaywrightBackend but override
+    # backend_type with their own enum member (fixed 2026-10-09; previously
+    # they inherited PLAYWRIGHT, which broke router identity checks).
+    for cls, want in (
+        (MoliBackend, BrowserBackendType.MOLI),
+        (CamoufoxBackend, BrowserBackendType.CAMOUFOX),
+        (AgentBrowserBackend, BrowserBackendType.AGENT_BROWSER),
+    ):
+        assert cls().backend_type == want, cls.__name__
 
 
 def test_base_backend_cannot_be_instantiated():

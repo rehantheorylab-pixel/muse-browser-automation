@@ -7,7 +7,11 @@ from core.types import BrowserBackendType
 
 class AgentBrowserBackend(PlaywrightBackend):
     """Adapter driving agent-browser via Playwright."""
-    
+
+    @property
+    def backend_type(self) -> BrowserBackendType:
+        return BrowserBackendType.AGENT_BROWSER
+
     def __init__(self, headless: bool = True):
         super().__init__(headless)
         self._proc = None
