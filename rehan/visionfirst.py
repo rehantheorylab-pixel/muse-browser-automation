@@ -168,7 +168,11 @@ class VisionFirst:
         self,
         ask_vision: Callable[[bytes, str], str],
         click_fn: Optional[Callable[[int, int], None]] = None,
-        attempts: int = 2,
+        # Default 1: the lane's contract is ONE vision call per locate
+        # (module docstring: "One call, one job"; lane cost 3000ms is
+        # priced for a single call). A retry is a second full vision
+        # call — pass attempts=2 explicitly to opt into it.
+        attempts: int = 1,
         input_scale: float = 1.0,
         grid_overlay: Optional[bool] = None,
         focus_region: Optional[Tuple[int, int, int, int]] = None,

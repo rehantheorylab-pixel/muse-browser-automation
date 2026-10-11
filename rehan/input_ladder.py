@@ -40,10 +40,12 @@ LADDER: List[str] = [INVOKE, SETVALUE, MESSAGE, CDP, HARDWARE]
 # Methods allowed when background_only=True (hidden virtual desktop).
 BACKGROUND_METHODS = {INVOKE, SETVALUE, MESSAGE, CDP}
 
-# Which methods apply to which action kinds.
+# Which methods apply to which action kinds, in LADDER (fastest-first)
+# order: MESSAGE (window messages) ranks ahead of CDP (DevTools
+# round-trip) per the module docstring's speed research.
 METHOD_FOR_ACTION: Dict[str, List[str]] = {
-    "click": [INVOKE, CDP, MESSAGE, HARDWARE],
-    "type": [SETVALUE, CDP, MESSAGE, HARDWARE],
+    "click": [INVOKE, MESSAGE, CDP, HARDWARE],
+    "type": [SETVALUE, MESSAGE, CDP, HARDWARE],
     "press": [MESSAGE, CDP, HARDWARE],  # hotkeys have no InvokePattern
 }
 

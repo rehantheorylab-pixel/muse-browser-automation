@@ -97,14 +97,14 @@ def route_action(
         return {"lane": "cache", "est_ms": LANE_COST_MS["cache"]}
     if page_map_hit:
         return {"lane": "pagemap", "est_ms": LANE_COST_MS["pagemap"]}
-    if compiler_parseable and single_action:
-        # Compiler actions still need grounding; with no page-map hit the
-        # honest estimate is vision_first's cost (one vision call), not the
-        # best-case 800ms. Report the lane as compiler (zero LLM) with the
-        # realistic total.
-        return {"lane": "compiler", "est_ms": LANE_COST_MS["vision_first"]}
     if compiler_parseable:
-        return {"lane": "compiler", "est_ms": LANE_COST_MS["compiler"]}
+        # Compiler actions still need grounding. page_map_hit returned
+        # earlier when True, so reaching here means the target is NOT in
+        # the page map — the honest total-time estimate is vision_first's
+        # cost (one vision call), not the best-case 800ms, which assumes
+        # a page-map hit that did not happen. (Module docstring: "a miss
+        # escalates the estimate to vision_first".)
+        return {"lane": "compiler", "est_ms": LANE_COST_MS["vision_first"]}
     if single_action and visionfirst_routing_enabled():
         return {"lane": "vision_first", "est_ms": LANE_COST_MS["vision_first"]}
     if single_action:
