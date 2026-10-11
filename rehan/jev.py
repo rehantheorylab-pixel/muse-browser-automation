@@ -37,9 +37,11 @@ ENV_MAX_STEPS = "S3REHAN_JEV_MAX_STEPS"
 
 # Operations the lane's policy may emit. The desktop extensions beyond
 # jev's browser set: OPEN_APP (launch by name), PRESS_KEY (hotkeys), DRAG
-# (deterministic diagonal drag, e.g. drawing on a canvas).
+# (deterministic diagonal drag, e.g. drawing on a canvas), CLICK_SEQ
+# (Tier 1 click batching: N clicks in one executor round-trip).
 OP_SET = (
     "CLICK",
+    "CLICK_SEQ",
     "TYPE_TEXT",
     "SELECT",
     "SCROLL_UP",
@@ -54,8 +56,10 @@ OP_SET = (
 
 # Ops whose arg is an element-table index.
 _INDEX_OPS = ("CLICK", "TYPE_TEXT", "SELECT", "SCROLL_UP", "SCROLL_DOWN", "DRAG")
+# CLICK_SEQ takes a LIST of indexes — validated separately.
 # Ops that move the mouse / type: freshness recheck applies before each.
-_TARGET_OPS = ("CLICK", "TYPE_TEXT", "SELECT", "SCROLL_UP", "SCROLL_DOWN", "DRAG")
+_TARGET_OPS = ("CLICK", "CLICK_SEQ", "TYPE_TEXT", "SELECT", "SCROLL_UP",
+               "SCROLL_DOWN", "DRAG")
 
 # UIA roles (normalized: lowercase, trailing "control" stripped) that accept
 # typed text. "text" (static TextControl) is deliberately excluded.
@@ -83,8 +87,46 @@ _TABLE_CAP = 250  # blueprint U2: jev caps at 250, report omitted count
 
 # Post-input settle times (blueprint U10): combobox fill waits for the
 # option list; everything else settles in one frame tick.
-_SETTLE_COMBO = 0.20
-_SETTLE_DEFAULT = 0.05
+# Tier 0 (DEEP_RESEARCH_ROUND2.md): fixed sleeps are the enemy. These are
+# the residual minimums for generated code; the executor prefers
+# evidence-based waits (wait_for below) wherever a condition exists.
+_SETTLE_COMBO = 0.15
+_SETTLE_DEFAULT = 0.02
+
+
+def wait_for(cond_fn, timeout_s: float = 2.0, poll_s: float = 0.05,
+             what: str = "condition") -> bool:
+    """Evidence-based wait: poll cond_fn until true or deadline.
+
+    Replaces blind time.sleep() (Tier 0, web-gpt-agent technique). Returns
+    True when the condition held, False on timeout. Never raises — the
+    caller decides whether a timeout is fatal.
+    """
+    import time as _t
+
+    deadline = _t.perf_counter() + max(0.0, timeout_s)
+    while True:
+        try:
+            if cond_fn():
+                return True
+        except Exception:
+            pass
+        if _t.perf_counter() >= deadline:
+            return False
+        _t.sleep(min(poll_s, max(0.0, deadline - _t.perf_counter())))
+
+
+# Click batching (Tier 1, uia_click_sequence pattern): N clicks in ONE
+# executor round-trip. Emits one code string that clicks all points with
+# a minimal inter-click settle, instead of N separate decide->execute
+# cycles (~2-4s of LLM time each).
+def batch_click_code(points, settle: float = _SETTLE_DEFAULT) -> str:
+    """Generate code for clicking several (x, y) points in one shot."""
+    parts = ["import pyautogui, time"]
+    for x, y in points:
+        parts.append(f"pyautogui.click({int(x)}, {int(y)})")
+        parts.append(f"time.sleep({settle})")
+    return "; ".join(parts) + ";"
 
 
 class JevError(Exception):
@@ -231,10 +273,11 @@ Visible UI elements (numbered table; markers: ▸ clickable, ✎ text entry, ☰
 {history}Reply with EXACTLY one JSON object, no other text.
 The JSON object MUST contain ALL THREE keys: "op", "index", "text" — ALWAYS include all three, using null for any field you don't need. Omitting a key is INVALID and will be rejected.
 Template:
-{{"op": "CLICK | TYPE_TEXT | SELECT | SCROLL_UP | SCROLL_DOWN | WAIT | DONE | BLOCKED | OPEN_APP | PRESS_KEY | DRAG", "index": <table number or null>, "text": "<text for TYPE_TEXT or null>"}}
+{{"op": "CLICK | CLICK_SEQ | TYPE_TEXT | SELECT | SCROLL_UP | SCROLL_DOWN | WAIT | DONE | BLOCKED | OPEN_APP | PRESS_KEY | DRAG", "index": <table number or null>, "text": "<text for TYPE_TEXT or null>"}}
 Example for a click (note "text": null is REQUIRED, not optional):
 {{"op": "CLICK", "index": 1, "text": null}}
 - CLICK: click element [index] (buttons, links, tabs, menu items, checkboxes, list items). For a text field you only want to FOCUS, pick its "Open <label>" twin row.
+- CLICK_SEQ: click SEVERAL elements in one shot — "index" is a LIST like [1, 4, 7]. Use when the task needs multiple clicks in a row (e.g. select three checkboxes). Faster than one CLICK per step.
 - TYPE_TEXT: type into text-entry element [index]. Put the text in "text" when you know it (preferred: saves a step); else "text": null and it is generated.
 - SELECT: choose the option row "[field] -> [option]" by its [index].
 - SCROLL_UP / SCROLL_DOWN: scroll inside element [index]; use 0 for the whole screen.
@@ -429,6 +472,21 @@ def validate_decision(obj: dict, n_rows: int):
         if not keys or len(keys) > 4 or not all(_KEY_RE.match(k) for k in keys):
             raise JevInvalid(f"PRESS_KEY needs 1-4 simple key names: {text!r}"[:120])
         return op, [_KEY_ALIASES.get(k, k) for k in keys]
+    if op == "CLICK_SEQ":
+        # Tier 1 click batching: index is a LIST of table numbers.
+        if not isinstance(index, list) or not index:
+            raise JevInvalid(f"CLICK_SEQ needs a non-empty index list, "
+                             f"got {index!r}"[:120])
+        if len(index) > 10:
+            raise JevInvalid("CLICK_SEQ limited to 10 clicks per batch")
+        for i in index:
+            if not isinstance(i, int) or isinstance(i, bool):
+                raise JevInvalid(f"CLICK_SEQ index not an int: {i!r}"[:120])
+            if not 0 <= i <= n_rows:
+                raise JevInvalid(f"CLICK_SEQ index {i} out of range")
+        if text is not None:
+            raise JevInvalid("CLICK_SEQ takes no text")
+        return op, index
     # Index ops.
     if not isinstance(index, int) or isinstance(index, bool):
         raise JevInvalid(f"{op} needs an integer index, got {index!r}"[:120])
@@ -641,9 +699,9 @@ class JevLane:
         staleness gate): a covered/moved target changes pixels, so this one
         check covers both staleness and occlusion.
         """
-        try:
-            from rehan.coordcache import frames_match
+        from rehan.coordcache import frames_match
 
+        try:
             return bool(frames_match(obs_png, fresh_png))
         except Exception:
             return False
@@ -766,6 +824,16 @@ class JevLane:
                 f"pyautogui.moveTo({x1}, {y1}); "
                 f"pyautogui.dragTo({x2}, {y2}, duration=0.8, button='left'); "
             )
+        if op == "CLICK_SEQ":
+            # Tier 1 click batching: N clicks, ONE executor round-trip.
+            # arg is a list of element indexes; text is ignored.
+            if not isinstance(arg, list) or not arg:
+                raise JevInvalid("CLICK_SEQ needs a non-empty index list")
+            pts = []
+            for idx in arg:
+                el, _kind, _row = _resolve(idx)
+                pts.append((int(el["x"]), int(el["y"])))
+            return batch_click_code(pts)
         raise JevInvalid(f"cannot build code for op {op!r}")
 
 

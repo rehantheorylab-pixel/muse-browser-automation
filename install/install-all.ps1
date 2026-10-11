@@ -341,6 +341,19 @@ try {
   }
 } catch { Write-Warn "FlareSolverr step failed: $($_.Exception.Message)" }
 
+Write-Step '6c. WSL2 + Linux workers (s3rehan parallel Linux pool)'
+$wslSetup = Join-Path $PSScriptRoot 'setup-wsl.ps1'
+try {
+  if (Test-Path $wslSetup) {
+    Write-Info 'Running setup-wsl.ps1 (idempotent; skips what is already done)...'
+    & powershell -ExecutionPolicy Bypass -File $wslSetup
+    $global:Summary['WSL2'] = 'setup-wsl.ps1 executed (see output above)'
+  } else {
+    Write-Warn 'setup-wsl.ps1 not found next to the installer — skipping WSL2.'
+    $global:Summary['WSL2'] = 'SKIPPED (setup-wsl.ps1 missing)'
+  }
+} catch { Write-Warn "WSL2 step failed: $($_.Exception.Message)" }
+
 # ================================================================ 7. Chrome extension
 Write-Step '7. Chrome extension (Muse Browser Control)'
 $extDir = Join-Path $Target 'extension'
