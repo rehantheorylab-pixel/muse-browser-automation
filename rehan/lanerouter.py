@@ -226,3 +226,69 @@ def speculative_route(
                             "est_ms": LANE_COST_MS["vision_first"]},
         }
     return {"primary": primary, "speculative": None}
+
+
+# ---------------------------------------------------------------------------
+# Display-isolation routing (unified architecture, 2026-10-10)
+# ---------------------------------------------------------------------------
+# Every GUI task needs a screen to act on. Priority:
+#   1. "monitor"  — virtual monitor (IddCx): own real screen, zero flicker.
+#   2. "vdesktop" — Windows virtual desktop: fallback, switch-capture.
+#   3. "inline"   — no isolation: headless/API tasks, or nothing available
+#                   (background-only input is then mandatory).
+# Pure function — microseconds, no model calls.
+
+DISPLAY_ORDER = ["monitor", "vdesktop", "inline"]
+
+
+def vmonitor_routing_enabled() -> bool:
+    return os.environ.get("S3REHAN_NO_VMONITOR", "0") != "1"
+
+
+def route_display(
+    task: Optional[Dict] = None,
+    *,
+    needs_gui: Optional[bool] = None,
+    monitors_available: bool = False,
+    vdesktop_available: bool = False,
+) -> Dict:
+    """Pick the display-isolation backend for a task.
+
+    Returns {"backend", "reason"}. ``needs_gui`` defaults to the task's
+    ``needs_gui``/``needs_windows_ui`` flags (either true counts).
+    Non-GUI tasks route "inline" — they need no screen at all.
+    """
+    task = task or {}
+    if needs_gui is None:
+        needs_gui = bool(task.get("needs_gui") or
+                         task.get("needs_windows_ui"))
+    if not needs_gui:
+        return {"backend": "inline",
+                "reason": "no GUI — headless/API task needs no screen"}
+    if monitors_available and vmonitor_routing_enabled():
+        return {"backend": "monitor",
+                "reason": "virtual monitor: own screen, zero flicker"}
+    if vdesktop_available:
+        return {"backend": "vdesktop",
+                "reason": "virtual desktop fallback (no VDD driver)"}
+    return {"backend": "inline",
+            "reason": ("no display isolation available — background-only "
+                       "input required")}
+
+
+def route_placement(task: Optional[Dict] = None, **kwargs) -> Dict:
+    """Combined platform + display routing for the unified worker pool.
+
+    Returns {"platform": "linux"|"windows", "display": {...route_display}}.
+    Platform comes from rehan.linux_worker.route_platform; display from
+    route_display above. kwargs are passed to route_display
+    (monitors_available, vdesktop_available, needs_gui).
+    """
+    try:
+        from rehan import linux_worker as _lw
+
+        platform = _lw.route_platform(task or {})
+    except Exception:
+        platform = "windows"
+    return {"platform": platform,
+            "display": route_display(task, **kwargs)}

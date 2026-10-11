@@ -63,7 +63,17 @@ Windows Virtual Desktop API access:
 Env:
   S3REHAN_WORKERS=N    worker desktops (default 3, 0 = inline single-task)
   S3REHAN_NO_VDESKTOP=1  force shim workers (debugging)
+  S3REHAN_NO_VMONITOR=1  disable virtual-monitor claiming (virtual-desktop
+                         fallback even when the VDD driver is installed)
+  S3REHAN_LINUX_VMONITOR=1  also claim a virtual monitor per Linux worker
+                         (for WSLg GUI apps; default 0 = headless Linux)
   S3REHAN_WORKER_MEM_MB=N  per-worker memory budget (default 1024)
+
+Display isolation priority (2026-10-10, unified architecture):
+  1. Virtual MONITOR (IddCx driver) — each worker's own real screen,
+     pixel-perfect capture with ZERO flicker on the user's display.
+  2. Virtual DESKTOP (pyvda) — fallback when no driver is installed.
+  3. Shim — no isolation (tests/dev).
 """
 
 import os
@@ -183,6 +193,12 @@ class VirtualDesktop:
 
                 view = AppView(hwnd)
                 view.move_to_desktop(self._vd)
+                try:
+                    from rehan import desktop_screenshot as _ds
+
+                    _ds.own_window(self, int(hwnd))
+                except Exception:
+                    pass
                 return True
             except Exception:
                 return False
@@ -225,6 +241,12 @@ class VirtualDesktop:
 
     def remove(self) -> None:
         with self._lock:
+            try:
+                from rehan import desktop_screenshot as _ds
+
+                _ds.release_desktop(self)
+            except Exception:
+                pass
             if not self._real or self._vd is None:
                 return
             try:
@@ -263,10 +285,16 @@ class Worker:
         worker_id: int,
         run_task: Callable[[Dict], Dict],
         desktop: Optional[VirtualDesktop] = None,
+        screen=None,
+        screen_release: Optional[Callable[[], None]] = None,
     ):
         self.worker_id = worker_id
         self.run_task = run_task
         self.desktop = desktop or VirtualDesktop(name=f"s3rehan-w{worker_id}")
+        # Virtual monitor (primary display isolation). When None the
+        # worker falls back to its virtual desktop for screenshots.
+        self.screen = screen
+        self._screen_release = screen_release
         # Disposable per-worker browser profile (security boundary).
         self.profile_dir = os.path.join(
             os.environ.get("TEMP", "/tmp"),
@@ -300,6 +328,15 @@ class Worker:
         self._inbox.put(None)
         self._thread.join(timeout=10)
         self.desktop.remove()
+        # Release the virtual monitor back to the pool (stops DXGI).
+        if self._screen_release is not None:
+            try:
+                self._screen_release()
+            except Exception:
+                pass
+            finally:
+                self._screen_release = None
+                self.screen = None
         # Best-effort profile cleanup (no cross-worker session leakage).
         try:
             import shutil
@@ -316,6 +353,51 @@ class Worker:
     @property
     def alive(self) -> bool:
         return self._thread.is_alive()
+
+    def screenshot(self, mode: str = "smart",
+                   allow_switch_fallback: bool = False) -> Optional[bytes]:
+        """PNG bytes of THIS worker's display — pixel-perfect.
+
+        Virtual-monitor path (primary): zero-flicker DXGI grab of the
+        worker's own monitor. Fallback: virtual-desktop capture via
+        rehan.desktop_screenshot ("smart" = idle-gated switch capture,
+        "composite" = zero-flicker approximate). Returns None when
+        capture is unavailable (e.g. non-Windows test env).
+        """
+        if self.screen is not None:
+            try:
+                from rehan import virtual_monitor as _vm
+
+                img = self.screen.grab()
+                if img is not None:
+                    return _vm.pil_to_png(img)
+            except Exception:
+                pass
+            # Monitor grab failed: fall through to the desktop path.
+        try:
+            from rehan import desktop_screenshot as _ds
+
+            return _ds.screenshot_png(self.desktop, mode=mode)
+        except Exception:
+            return None
+
+    @property
+    def display_backend(self) -> str:
+        """'monitor' | 'vdesktop' | 'shim'."""
+        if self.screen is not None:
+            return "monitor"
+        return ("vdesktop"
+                if bool(getattr(self.desktop, "is_real", False)) else "shim")
+
+    def screenshot_info(self, **kwargs) -> Optional[dict]:
+        """screenshot() plus the info dict (flicker_ms, waited_ms, mode)."""
+        try:
+            from rehan import desktop_screenshot as _ds
+
+            _img, info = _ds.capture_desktop_info(self.desktop, **kwargs)
+            return info
+        except Exception:
+            return None
 
     @property
     def heartbeat_stale(self) -> bool:
@@ -390,6 +472,8 @@ class TaskDispatcher:
         autoscale: Optional[bool] = None,
         scale_up_delay_s: float = 2.0,
         idle_timeout_s: float = 300.0,
+        use_monitors: Optional[bool] = None,
+        monitors_for_linux: Optional[bool] = None,
     ):
         """Unified pool of Windows + Linux (WSL2) workers.
 
@@ -405,6 +489,12 @@ class TaskDispatcher:
           scale_up_delay_s: queue wait before autoscale spawns (avoids
                            breaking priority/queueing semantics).
           idle_timeout_s:  reap autoscaled workers idle longer than this.
+          use_monitors:    claim a virtual monitor per Windows worker
+                           (default: auto — on when the VDD driver is
+                           present; S3REHAN_NO_VMONITOR=1 forces off).
+          monitors_for_linux: also claim a virtual monitor per Linux
+                           worker, for WSLg GUI apps (default False;
+                           S3REHAN_LINUX_VMONITOR=1 enables).
         """
         self.run_task = run_task
         self.n_workers = _mem_cap_workers(max(0, int(n_workers)))
@@ -413,6 +503,17 @@ class TaskDispatcher:
         if autoscale is None:
             autoscale = os.environ.get("S3REHAN_AUTOSCALE", "1") != "0"
         self.autoscale = bool(autoscale)
+        if use_monitors is None:
+            use_monitors = os.environ.get("S3REHAN_NO_VMONITOR", "0") != "1"
+        self.use_monitors = bool(use_monitors)
+        if monitors_for_linux is None:
+            monitors_for_linux = (
+                os.environ.get("S3REHAN_LINUX_VMONITOR", "0") != "0")
+        self.monitors_for_linux = bool(monitors_for_linux)
+        # Virtual-monitor pool (primary display isolation). Created in
+        # start() only when the driver is actually present; otherwise
+        # workers fall back to virtual desktops.
+        self.monitor_pool = None
         try:
             self.scale_up_delay_s = float(
                 os.environ.get("S3REHAN_SCALE_UP_DELAY_S",
@@ -442,9 +543,34 @@ class TaskDispatcher:
     # -- lifecycle ----------------------------------------------------
 
     def _make_worker(self, kind: str):
-        """Create (not start) a worker of kind 'windows'|'linux'."""
+        """Create (not start) a worker of kind 'windows'|'linux'.
+
+        Claims a virtual monitor from the pool when enabled (Windows
+        workers always; Linux workers only when monitors_for_linux).
+        A failed claim degrades to the virtual-desktop fallback — never
+        raises.
+        """
         wid = self._next_wid
         self._next_wid += 1
+        screen = None
+        screen_release = None
+        want_monitor = (
+            self.monitor_pool is not None
+            and (kind == "windows" and self.use_monitors
+                 or kind == "linux" and self.monitors_for_linux)
+        )
+        if want_monitor:
+            try:
+                claim_id = f"worker-{wid}"
+                screen = self.monitor_pool.claim(claim_id)
+
+                def _release(_pool=self.monitor_pool, _cid=claim_id):
+                    _pool.release(_cid)
+
+                screen_release = _release
+            except Exception:
+                screen = None
+                screen_release = None
         if kind == "linux":
             if _linux_worker is None:
                 raise RuntimeError("linux_worker module unavailable")
@@ -453,8 +579,10 @@ class TaskDispatcher:
             # Route through _run_one so results land in _results/_done_ids
             # (same bookkeeping as Windows workers).
             return _linux_worker.WSLWorker(
-                wid, lambda task: self._run_one(task, runner=linux_run))
-        return Worker(wid, self._run_one)
+                wid, lambda task: self._run_one(task, runner=linux_run),
+                screen=screen, screen_release=screen_release)
+        return Worker(wid, self._run_one,
+                      screen=screen, screen_release=screen_release)
 
     def _linux_pool_allowed(self) -> bool:
         if _linux_worker is None:
@@ -468,6 +596,19 @@ class TaskDispatcher:
         with self._lock:
             if self._started:
                 return
+            # Primary display isolation: one virtual monitor per worker.
+            # Pool creation never installs anything — if the VDD driver is
+            # absent, workers transparently use virtual desktops instead.
+            if self.use_monitors:
+                try:
+                    from rehan import virtual_monitor as _vm
+
+                    if _vm.monitors_available():
+                        pool = _vm.MonitorPool()
+                        pool.refresh()
+                        self.monitor_pool = pool
+                except Exception:
+                    self.monitor_pool = None
             for _ in range(self.n_workers):
                 w = self._make_worker("windows")
                 w.start()
@@ -613,11 +754,20 @@ class TaskDispatcher:
                 task = ent["task"]
                 kind = self._route_kind(task)
                 explicit_linux = self._task_linux_explicit(task)
+                needs_display = bool(task.get("needs_gui"))
                 assigned = False
-                # 1) idle worker of the routed kind.
-                for w in self.workers:
-                    if getattr(w, "platform", "windows") != kind:
-                        continue
+                # 1) idle worker of the routed kind. GUI tasks prefer
+                #    workers with a claimed virtual monitor (pixel-perfect
+                #    zero-flicker screenshots); others take any idle worker.
+                candidates = [
+                    w for w in self.workers
+                    if getattr(w, "platform", "windows") == kind
+                ]
+                if needs_display:
+                    candidates.sort(
+                        key=lambda w: 0
+                        if getattr(w, "screen", None) is not None else 1)
+                for w in candidates:
                     if w.submit(task):
                         assigned = True
                         break
@@ -809,6 +959,12 @@ class TaskDispatcher:
         with self._lock:
             workers = list(self.workers)
             pending = list(self._pending)
+            pool = self.monitor_pool
+        pool_status = None
+        try:
+            pool_status = pool.status() if pool is not None else None
+        except Exception:
+            pool_status = None
         return {
             "n_workers": len(workers),
             "n_windows": sum(1 for w in workers
@@ -817,6 +973,8 @@ class TaskDispatcher:
             "n_linux": sum(1 for w in workers
                            if getattr(w, "platform", "windows") == "linux"),
             "autoscale": self.autoscale,
+            "use_monitors": self.use_monitors,
+            "monitor_pool": pool_status,
             "busy": sum(1 for w in workers if w.busy),
             "idle": sum(1 for w in workers if not w.busy),
             "pending": len(pending),
@@ -825,6 +983,9 @@ class TaskDispatcher:
             "desktops_real": sum(1 for w in workers
                                  if getattr(getattr(w, "desktop", None),
                                             "is_real", False)),
+            "monitors_claimed": sum(1 for w in workers
+                                    if getattr(w, "screen", None)
+                                    is not None),
             "workers": [
                 {
                     "id": w.worker_id,
@@ -832,6 +993,10 @@ class TaskDispatcher:
                     "autoscaled": bool(getattr(w, "autoscaled", False)),
                     "state": w.state,
                     "alive": w.alive,
+                    "display": (w.display_backend
+                                if hasattr(w, "display_backend") else
+                                ("monitor" if getattr(w, "screen", None)
+                                 is not None else "vdesktop")),
                     "desktop": getattr(getattr(w, "desktop", None),
                                        "name", None),
                     "desktop_real": getattr(getattr(w, "desktop", None),

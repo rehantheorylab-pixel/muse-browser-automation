@@ -27,12 +27,23 @@ Resource model:
   - _max_linux_workers() derives a thread cap from the guest cap so the
     pool can't grow without bound: (guest_cap - 1GB headroom) // budget.
 
+Linux GUI apps (WSL2 + WSLg):
+  WSL2 ships WSLg — Linux GUI apps render as native Windows windows
+  (Weston/RDP backend, window class "wslg"). A Linux worker that claims
+  a virtual monitor can host GUI Linux apps on its own screen:
+  move_wslg_windows_to_monitor() finds this session's WSLg windows and
+  moves them onto the monitor via SetWindowPos; the worker then
+  screenshots them with screen.grab() — zero flicker, same as Windows
+  workers. Headless tasks skip this entirely (no monitor needed).
+
 Env:
   S3REHAN_NO_WSL=1            force shim (tests, non-Windows dev)
   S3REHAN_WSL_DISTRO=name     WSL distro (default "Ubuntu")
   S3REHAN_WSL_MEM_MB=N        guest memory cap reference (default 4096)
   S3REHAN_WSL_WORKER_MEM_MB=N per-task memory budget (default 1024)
   S3REHAN_LINUX_WORKERS=N     requested linux workers (default 0)
+  S3REHAN_LINUX_VMONITOR=1    claim a virtual monitor per Linux worker
+                              (for WSLg GUI apps)
 """
 
 import base64
@@ -347,6 +358,67 @@ def default_wsl_run_task(task: Dict) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# WSLg GUI placement on a virtual monitor
+# ---------------------------------------------------------------------------
+
+def move_wslg_windows_to_monitor(monitor: Dict) -> int:
+    """Move this session's WSLg (Linux GUI) windows onto a virtual monitor.
+
+    WSLg renders Linux GUI apps as native Windows windows owned by
+    ``wslg.exe``. This finds those top-level visible windows and moves
+    them onto ``monitor`` (a virtual-monitor dict from
+    rehan.virtual_monitor) via SetWindowPos — the user's physical screen
+    is untouched. Returns windows moved. Windows-only; 0 elsewhere.
+    """
+    if os.name != "nt":
+        return 0
+    moved = 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from rehan import virtual_monitor as _vm
+
+        user32 = ctypes.windll.user32
+        psapi = ctypes.windll.psapi
+        hwnds: List[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                hproc = ctypes.windll.kernel32.OpenProcess(
+                    0x0400 | 0x0010, False, pid.value)  # QUERY_INFO|VM_READ
+                if not hproc:
+                    return True
+                try:
+                    buf = ctypes.create_unicode_buffer(260)
+                    if psapi.GetModuleFileNameExW(hproc, None, buf, 260):
+                        exe = (buf.value or "").lower()
+                        if "wslg.exe" in exe:
+                            hwnds.append(int(hwnd))
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(hproc)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        for h in hwnds:
+            try:
+                if _vm.move_window_to_monitor(h, monitor):
+                    moved += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return moved
+
+
+# ---------------------------------------------------------------------------
 # WSLWorker — mirrors rehan.workers.Worker
 # ---------------------------------------------------------------------------
 
@@ -368,11 +440,17 @@ class WSLWorker:
         self,
         worker_id: int,
         run_task: Optional[Callable[[Dict], Dict]] = None,
+        screen=None,
+        screen_release: Optional[Callable[[], None]] = None,
     ):
         self.worker_id = worker_id
         self.run_task = run_task or default_wsl_run_task
         self.background_only = True
         self.autoscaled = False
+        # Optional virtual monitor (for WSLg GUI apps). Headless tasks
+        # leave this None — no monitor wasted.
+        self.screen = screen
+        self._screen_release = screen_release
         self.state = self.IDLE
         self.current_task: Optional[Dict] = None
         self.last_result: Optional[Dict] = None
@@ -394,6 +472,45 @@ class WSLWorker:
             self.state = self.STOPPED
         self._inbox.put(None)
         self._thread.join(timeout=10)
+        if self._screen_release is not None:
+            try:
+                self._screen_release()
+            except Exception:
+                pass
+            finally:
+                self._screen_release = None
+                self.screen = None
+
+    @property
+    def display_backend(self) -> str:
+        """'monitor' when a virtual monitor is claimed, else 'headless'."""
+        return "monitor" if self.screen is not None else "headless"
+
+    def screenshot(self) -> Optional[bytes]:
+        """PNG bytes of this worker's virtual monitor (WSLg GUI apps).
+
+        Returns None for headless workers (nothing to see) or when the
+        grab fails.
+        """
+        if self.screen is None:
+            return None
+        try:
+            from rehan import virtual_monitor as _vm
+
+            img = self.screen.grab()
+            return _vm.pil_to_png(img) if img is not None else None
+        except Exception:
+            return None
+
+    def place_gui_on_monitor(self) -> int:
+        """Move this session's WSLg windows onto the worker's monitor.
+
+        Call after launching a Linux GUI app inside WSL2. Returns the
+        number of windows moved. No-op without a claimed monitor.
+        """
+        if self.screen is None:
+            return 0
+        return move_wslg_windows_to_monitor(self.screen.monitor)
 
     @property
     def busy(self) -> bool:
