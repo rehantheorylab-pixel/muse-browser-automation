@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import websockets
 
 from core.interfaces import BaseBrowserBackend
-from core.types import BrowserBackendType, ElementBounds, PageModel, ResolutionMethod, ResolvedElement
+from core.types import BrowserBackendType, PageModel
 
 CDP_HOST = "127.0.0.1"
 CDP_PORT = 9224
@@ -47,15 +47,26 @@ KEYMAP = {
 
 
 class ObscuraBackend(BaseBrowserBackend):
-    """Adapter driving Obscura stealth browser via CDP."""
+    """Adapter driving Obscura stealth browser via CDP.
 
-    def __init__(self, host: str = CDP_HOST, port: int = CDP_PORT):
+    Input goes through ``core.stealth.behavior`` (Bezier mouse paths,
+    human scroll plans, keystroke dynamics) dispatched as trusted CDP
+    ``Input.*`` events. Pass ``human=False`` for instant robotic input.
+    """
+
+    def __init__(self, host: str = CDP_HOST, port: int = CDP_PORT,
+                 human: bool = True, behavior_seed: Optional[int] = None):
         self.host = host
         self.port = port
+        self.human = human
         self._ws: Optional[Any] = None
         self._msg_id = 0
         self._target_id: Optional[str] = None
         self._session_id: Optional[str] = None
+        self._cursor = (0.0, 0.0)  # last known mouse position
+        import random as _random
+        # Seeded RNG: reproducible human behavior across runs.
+        self._behavior_rng = _random.Random(behavior_seed)
 
     @property
     def backend_type(self) -> BrowserBackendType:
@@ -86,7 +97,7 @@ class ObscuraBackend(BaseBrowserBackend):
             raise RuntimeError(
                 f"Obscura is not serving on {self.host}:{self.port} (Error: {e}). "
                 "Start it with python obscura/profiles.py main"
-            )
+            ) from e
             
         if not ws_url:
             ws_url = f"ws://{self.host}:{self.port}/devtools/browser"
@@ -161,12 +172,28 @@ class ObscuraBackend(BaseBrowserBackend):
         return res.get("value")
 
     async def click(self, tab_id: str, x: int, y: int) -> bool:
+        if self.human:
+            # Bezier path + Fitts timing + pre-click hesitation, all via
+            # trusted CDP Input.* events (core.stealth.behavior).
+            from core.stealth.behavior import human_click
+            self._cursor = await human_click(
+                self._cdp, self._cursor, float(x), float(y),
+                rng=self._behavior_rng,
+            )
+            return True
         await self._cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
         await self._cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
         await self._cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+        self._cursor = (float(x), float(y))
         return True
 
     async def type_text(self, tab_id: str, text: str) -> bool:
+        if self.human:
+            # Keystroke dynamics: lognormal flight times, digraph speedup,
+            # typo + backspace corrections (core.stealth.behavior).
+            from core.stealth.behavior import human_type
+            await human_type(self._cdp, text, rng=self._behavior_rng)
+            return True
         for ch in text:
             await self._cdp("Input.dispatchKeyEvent", type="keyDown", text=ch)
         return True
@@ -182,6 +209,32 @@ class ObscuraBackend(BaseBrowserBackend):
         return True
 
     async def scroll(self, tab_id: str, delta_x: int = 0, delta_y: int = 400) -> bool:
+        if self.human:
+            # Human scroll plan: notch bursts, momentum tail, reading
+            # pauses, occasional reverse micro-scrolls (core.stealth.behavior).
+            # CDP mouseWheel is single-axis per call: drive the dominant one.
+            from core.stealth.behavior import human_scroll
+            if abs(delta_y) >= abs(delta_x):
+                total, dx = delta_y, 0
+            else:
+                total, dx = delta_x, 0
+            cx, cy = self._cursor
+            if dx:
+                # Horizontal scroll via deltaX on the dominant axis.
+                from core.stealth.behavior import human_scroll_plan, dispatch_events
+                events = human_scroll_plan(total, rng=self._behavior_rng)
+                for ev in events:
+                    ev = dict(ev)
+                    if ev.get("type") == "mouseWheel":
+                        ev["deltaX"], ev["deltaY"] = ev.get("deltaY", 0), 0
+                        ev.setdefault("x", cx)
+                        ev.setdefault("y", cy)
+                    await dispatch_events(self._cdp, [ev])
+            else:
+                await human_scroll(
+                    self._cdp, total, x=cx, y=cy, rng=self._behavior_rng
+                )
+            return True
         try:
             await self.evaluate(tab_id, f"window.scrollBy({delta_x}, {delta_y})")
         except Exception:

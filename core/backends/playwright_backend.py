@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
+import logging
 from typing import Any, Dict, List, Optional
 
 from core.interfaces import BaseBrowserBackend
-from core.types import BrowserBackendType, ElementBounds, PageModel, ResolutionMethod, ResolvedElement
+from core.types import BrowserBackendType, PageModel
+
+logger = logging.getLogger(__name__)
 
 
 class PlaywrightBackend(BaseBrowserBackend):

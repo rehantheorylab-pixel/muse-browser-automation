@@ -8,8 +8,10 @@ from typing import Any, Dict, List, Optional
 
 from core.adapters.base import BaseToolAdapter
 from core.adapters.browser_adapters import ChromeAdapter, CliBrowserAdapter, ObscuraAdapter, PlaywrightAdapter
-from core.adapters.http_adapter import HttpStaticAdapter
 from core.adapters.ytdlp_adapter import YtDlpAdapter
+# NOTE: HttpStaticAdapter is imported lazily in __init__ (not here) to
+# avoid a core.fetch.engine <-> core.adapters.http_adapter import cycle:
+# http_adapter imports core.fetch.extractor, which triggers core.fetch.__init__.
 from core.fetch.cache import FetchCache
 from core.fetch.fallback import CircuitBreaker, ErrorClassifier, FailureMemory, FetchErrorKind
 from core.fetch.normalizer import FetchResult
@@ -37,7 +39,9 @@ class UniversalFetchEngine:
         self.failure_memory = FailureMemory()
         self.reddit = RedditFetcher()
 
-        # Adapter lookup
+        # Adapter lookup (HttpStaticAdapter imported lazily: see module note).
+        from core.adapters.http_adapter import HttpStaticAdapter
+
         self._adapters: Dict[str, BaseToolAdapter] = {
             "http_static": HttpStaticAdapter(),
             "playwright": PlaywrightAdapter(),

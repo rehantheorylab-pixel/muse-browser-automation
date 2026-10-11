@@ -337,9 +337,9 @@ try{
     for(var y = 0; y < sh; y++){
       for(var x = 0; x < sw; x++){
         for(var c = 0; c < 3; c++){
-          var nse = pxNoise(x + sx, y + sy, c);
+          var nse = pxNoise(x + sx, y + sy, c); // [-0.5, 0.5)
           var i = ((y * sw) + x) * 4 + c;
-          var v = d[i] + (nse > 0.5 ? 1 : (nse < -0.5 ? -1 : 0));
+          var v = d[i] + (nse >= 0 ? 1 : -1);   // +/-1 LSB, seeded & deterministic
           d[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
         }
       }

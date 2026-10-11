@@ -157,7 +157,9 @@ class Agent:
         """Claim a virtual monitor when possible, else use the desktop.
 
         Children share the parent's pool so one pool serves the whole
-        subtree. Never raises: any failure degrades to the desktop path.
+        subtree. Never raises: any failure degrades to the desktop path,
+        but WARNS loudly so the operator knows true-background (virtual
+        monitor) is not active.
         """
         pool = self._monitor_pool
         if pool is None and self.parent is not None:
@@ -169,6 +171,14 @@ class Agent:
                 if _vm.monitors_available():
                     pool = _vm.MonitorPool()
                     pool.refresh()
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"Agent '{self.name}': VIRTUAL MONITOR PRINCIPLE NOT "
+                        f"MET — VDD driver not installed. Using virtual "
+                        f"desktop fallback (visible switching for GUI). "
+                        f"Install VDD for true background.",
+                        UserWarning, stacklevel=3)
             except Exception:
                 pool = None
         self._monitor_pool = pool

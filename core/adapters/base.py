@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from core.fetch.normalizer import FetchResult
+if TYPE_CHECKING:
+    # Imported only for annotations (breaks a core.adapters.base <->
+    # core.fetch.engine import cycle at runtime).
+    from core.fetch.normalizer import FetchResult
 
 
 class BaseToolAdapter(ABC):

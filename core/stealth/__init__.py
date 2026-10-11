@@ -22,8 +22,15 @@ invisible_playwright research, Oct 2026):
 
 from core.stealth.fingerprint import FingerprintProfile, build_injection_js
 from core.stealth.behavior import (
+    BehaviorConfig,
+    action_gap_ms,
     bezier_mouse_path,
+    dispatch_events,
     fitts_duration_ms,
+    human_click,
+    human_scroll,
+    human_scroll_plan,
+    human_type,
     human_type_plan,
 )
 from core.stealth.tls_client import make_api_client, is_curl_cffi_available
@@ -31,8 +38,15 @@ from core.stealth.tls_client import make_api_client, is_curl_cffi_available
 __all__ = [
     "FingerprintProfile",
     "build_injection_js",
+    "BehaviorConfig",
+    "action_gap_ms",
     "bezier_mouse_path",
+    "dispatch_events",
     "fitts_duration_ms",
+    "human_click",
+    "human_scroll",
+    "human_scroll_plan",
+    "human_type",
     "human_type_plan",
     "make_api_client",
     "is_curl_cffi_available",

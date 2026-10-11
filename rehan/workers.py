@@ -1,8 +1,13 @@
-"""Parallel task workers, each isolated on its own Windows virtual desktop.
+"""Parallel task workers, each isolated on its own display.
+
+PRINCIPLE (2026-10-11): Virtual MONITORS are primary. Each worker gets its
+own virtual monitor (IddCx driver) = its own "separate computer". Zero
+flicker, zero switching, true background. Virtual DESKTOPS are fallback
+when VDD is not installed (with loud warning).
 
 Rehan's requirement (2026-10-10): multiple automation tasks run
-simultaneously — task 1 on virtual desktop 2, task 2 on desktop 3, etc.
-The user stays on their main desktop and never sees task windows.
+simultaneously — task 1 on monitor 1, task 2 on monitor 2, etc.
+The user stays on their main monitor and never sees task windows.
 
 PRINCIPAL-ENGINEER DESIGN NOTES (upgraded from rough direction):
 
@@ -598,7 +603,7 @@ class TaskDispatcher:
                 return
             # Primary display isolation: one virtual monitor per worker.
             # Pool creation never installs anything — if the VDD driver is
-            # absent, workers transparently use virtual desktops instead.
+            # absent, workers fall back to virtual desktops.
             if self.use_monitors:
                 try:
                     from rehan import virtual_monitor as _vm
@@ -607,6 +612,20 @@ class TaskDispatcher:
                         pool = _vm.MonitorPool()
                         pool.refresh()
                         self.monitor_pool = pool
+                    else:
+                        # LOUD WARNING: principle not met. Virtual monitors
+                        # (true background, zero flicker) require the VDD
+                        # driver. Falling back to virtual desktops (visible
+                        # switching for GUI work). Install VDD for true
+                        # background operation.
+                        import warnings
+                        warnings.warn(
+                            "VIRTUAL MONITOR PRINCIPLE NOT MET: VDD driver "
+                            "not installed. Workers will use virtual desktops "
+                            "(visible switching) instead of virtual monitors "
+                            "(true background). Run install/setup-all.ps1 as "
+                            "admin to install VDD.",
+                            UserWarning, stacklevel=2)
                 except Exception:
                     self.monitor_pool = None
             for _ in range(self.n_workers):

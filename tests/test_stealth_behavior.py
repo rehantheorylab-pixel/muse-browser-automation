@@ -142,3 +142,101 @@ def test_behavior_config_defaults():
     assert cfg.wpm == 55.0
     assert cfg.typo_rate == 0.035
     assert isinstance(cfg.rng(), random.Random)
+
+
+# --- CDP dispatch (proves plans actually DRIVE input) ------------------------
+
+import asyncio as _asyncio
+
+
+class _FakeCdp:
+    """Records (method, params) instead of touching a browser."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, method, **params):
+        self.calls.append((method, params))
+
+
+def _no_sleep(monkeypatch):
+    async def fake_sleep(_):
+        return None
+    monkeypatch.setattr(_asyncio, "sleep", fake_sleep)
+
+
+def test_dispatch_events_sends_mouse_and_key_methods(monkeypatch):
+    from core.stealth.behavior import dispatch_events
+    _no_sleep(monkeypatch)
+    cdp = _FakeCdp()
+    events = [
+        {"type": "mouseMoved", "x": 10.0, "y": 20.0, "delay_ms": 5.0,
+         "pointerType": "mouse", "pressure": 0, "buttons": 0},
+        {"type": "pause", "delay_ms": 50.0},
+        {"type": "keyDown", "key": "a", "code": "KeyA", "text": "a",
+         "windowsVirtualKeyCode": 65, "delay_ms": 30.0},
+        {"type": "keyUp", "key": "a", "code": "KeyA",
+         "windowsVirtualKeyCode": 65, "delay_ms": 60.0},
+    ]
+    _asyncio.run(dispatch_events(cdp, events))
+    methods = [m for m, _ in cdp.calls]
+    assert methods == [
+        "Input.dispatchMouseEvent",
+        "Input.dispatchKeyEvent",
+        "Input.dispatchKeyEvent",
+    ]
+    # delay_ms and other non-CDP keys are stripped.
+    _, mouse_params = cdp.calls[0]
+    assert "delay_ms" not in mouse_params
+    assert mouse_params["type"] == "mouseMoved"
+    _, key_params = cdp.calls[1]
+    assert key_params["type"] == "keyDown"
+    assert key_params["text"] == "a"
+
+
+def test_human_click_drives_bezier_path(monkeypatch):
+    from core.stealth.behavior import human_click
+    _no_sleep(monkeypatch)
+    cdp = _FakeCdp()
+    new_cursor = _asyncio.run(
+        human_click(cdp, (0.0, 0.0), 300.0, 200.0, rng=rng())
+    )
+    methods = [m for m, _ in cdp.calls]
+    assert "Input.dispatchMouseEvent" in methods
+    moves = [p for m, p in cdp.calls if p.get("type") == "mouseMoved"]
+    assert len(moves) >= 8, "Bezier path should emit many move events"
+    presses = [p for m, p in cdp.calls if p.get("type") == "mousePressed"]
+    assert len(presses) == 1
+    # Cursor tracks the jittered click point.
+    assert abs(new_cursor[0] - 300.0) <= 5
+    assert abs(new_cursor[1] - 200.0) <= 4
+
+
+def test_human_scroll_drives_wheel_events(monkeypatch):
+    from core.stealth.behavior import human_scroll
+    _no_sleep(monkeypatch)
+    cdp = _FakeCdp()
+    _asyncio.run(human_scroll(cdp, 500, x=100, y=100, rng=rng()))
+    wheels = [p for m, p in cdp.calls
+              if m == "Input.dispatchMouseEvent" and p.get("type") == "mouseWheel"]
+    assert wheels, "scroll plan must emit mouseWheel events"
+    assert all(p["x"] == 100 and p["y"] == 100 for p in wheels)
+    # Forward notches sum to the requested distance; the plan also adds
+    # occasional reverse micro-scrolls (human-like), so the net is lower.
+    forward = sum(p["deltaY"] for p in wheels if p["deltaY"] > 0)
+    net = sum(p["deltaY"] for p in wheels)
+    assert forward == 500, f"forward notches must total 500, got {forward}"
+    assert 400 <= net <= 500, f"net scroll out of range: {net}"
+
+
+def test_human_type_drives_key_events(monkeypatch):
+    from core.stealth.behavior import human_type
+    _no_sleep(monkeypatch)
+    cdp = _FakeCdp()
+    _asyncio.run(human_type(cdp, "hi", rng=rng(3), wpm=55.0))
+    keys = [p for m, p in cdp.calls if m == "Input.dispatchKeyEvent"]
+    downs = [p for p in keys if p["type"] == "keyDown"]
+    ups = [p for p in keys if p["type"] == "keyUp"]
+    assert len(downs) == len(ups) >= 2
+    typed = "".join(p.get("text", "") for p in downs)
+    assert typed == "hi"

@@ -30,10 +30,11 @@ All randomness is seeded (``rng`` param) so runs are reproducible.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +387,117 @@ class BehaviorConfig:
 
     def rng(self) -> random.Random:
         return random.Random(self.seed)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch — actually DRIVE input through CDP trusted events.
+#
+# ``send`` is an async callable ``send(method, **params)`` (e.g. a CDP
+# ``Input.dispatch*`` sender). Each planned event is emitted with its
+# irregular per-event delay, so the timing humanization in the plans
+# above reaches the browser instead of dying in a returned list.
+# ---------------------------------------------------------------------------
+
+_MOUSE_EVENT_PARAMS = {
+    "type", "x", "y", "button", "clickCount", "buttons",
+    "pointerType", "pressure", "tiltX", "tiltY", "twist",
+    "deltaX", "deltaY",
+}
+_KEY_EVENT_PARAMS = {
+    "type", "key", "code", "text", "windowsVirtualKeyCode",
+    "nativeVirtualKeyCode", "autoRepeat", "isKeypad", "isSystemKey",
+}
+
+_EVENT_METHOD = {
+    "mouseMoved": "Input.dispatchMouseEvent",
+    "mousePressed": "Input.dispatchMouseEvent",
+    "mouseReleased": "Input.dispatchMouseEvent",
+    "mouseWheel": "Input.dispatchMouseEvent",
+    "keyDown": "Input.dispatchKeyEvent",
+    "keyUp": "Input.dispatchKeyEvent",
+    "rawKeyDown": "Input.dispatchKeyEvent",
+    "char": "Input.dispatchKeyEvent",
+}
+
+
+async def dispatch_events(
+    send: Callable[..., Awaitable[Any]],
+    events: List[Dict[str, Any]],
+) -> None:
+    """Emit planned behavior events through a CDP sender with human timing.
+
+    ``events`` are dicts from :func:`bezier_mouse_path`,
+    :func:`human_scroll_plan` or :func:`human_type_plan`. ``pause`` events
+    only sleep. Unknown/extra keys are stripped so only valid CDP params
+    are sent.
+    """
+    for ev in events:
+        delay_ms = float(ev.get("delay_ms", 0) or 0)
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
+        etype = ev.get("type")
+        if etype == "pause":
+            continue
+        method = _EVENT_METHOD.get(etype)
+        if not method:
+            continue
+        if method == "Input.dispatchKeyEvent":
+            params = {k: v for k, v in ev.items() if k in _KEY_EVENT_PARAMS}
+            # CDP requires the event type as a param, not "type".
+            params["type"] = etype
+        else:
+            params = {k: v for k, v in ev.items() if k in _MOUSE_EVENT_PARAMS}
+            params["type"] = etype
+        await send(method, **params)
+
+
+async def human_click(
+    send: Callable[..., Awaitable[Any]],
+    start: Tuple[float, float],
+    x: float,
+    y: float,
+    rng: Optional[random.Random] = None,
+    target_width_px: float = 24.0,
+) -> Tuple[float, float]:
+    """Move along a Bezier path from ``start`` and click at (x, y).
+
+    Returns the new cursor position (the jittered click point).
+    """
+    rng = rng or random.Random()
+    events = bezier_mouse_path(start, (x, y), rng=rng,
+                               target_width_px=target_width_px)
+    await dispatch_events(send, events)
+    pressed = [e for e in events if e["type"] == "mousePressed"]
+    if pressed:
+        return (pressed[-1]["x"], pressed[-1]["y"])
+    return (x, y)
+
+
+async def human_scroll(
+    send: Callable[..., Awaitable[Any]],
+    total_px: int,
+    x: float = 0,
+    y: float = 0,
+    rng: Optional[random.Random] = None,
+) -> None:
+    """Scroll with notch bursts / momentum / reading pauses via mouseWheel."""
+    rng = rng or random.Random()
+    events = human_scroll_plan(total_px, rng=rng)
+    for ev in events:
+        ev = dict(ev)
+        if ev.get("type") == "mouseWheel":
+            ev.setdefault("x", x)
+            ev.setdefault("y", y)
+        await dispatch_events(send, [ev])
+
+
+async def human_type(
+    send: Callable[..., Awaitable[Any]],
+    text: str,
+    rng: Optional[random.Random] = None,
+    wpm: float = 55.0,
+) -> None:
+    """Type with lognormal flight times, digraph speedup and typo fixes."""
+    rng = rng or random.Random()
+    events = human_type_plan(text, rng=rng, wpm=wpm)
+    await dispatch_events(send, events)

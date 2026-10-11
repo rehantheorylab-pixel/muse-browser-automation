@@ -189,14 +189,71 @@ def test_camoufox_unavailable_when_not_importable():
         assert run(CamoufoxBackend().is_available()) is False
 
 
-def test_agent_browser_available_when_exe_present(monkeypatch):
-    monkeypatch.setattr("os.path.isfile", lambda p: True)
+def test_agent_browser_available_when_cli_on_path(monkeypatch):
+    # AgentBrowserBackend detects the real `agent-browser` CLI on PATH
+    # (same probe as tools/installer.py and tools/detector.py).
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agent-browser")
     assert run(AgentBrowserBackend().is_available()) is True
 
 
-def test_agent_browser_unavailable_when_exe_missing(monkeypatch):
-    monkeypatch.setattr("os.path.isfile", lambda p: False)
+def test_agent_browser_unavailable_when_cli_missing(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.delenv("AGENT_BROWSER_BIN", raising=False)
     assert run(AgentBrowserBackend().is_available()) is False
+
+
+def test_agent_browser_start_raises_when_cli_missing(monkeypatch):
+    # No silent fallback to stock Playwright: start() raises.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.delenv("AGENT_BROWSER_BIN", raising=False)
+    with pytest.raises(RuntimeError, match="not installed"):
+        run(AgentBrowserBackend().start())
+
+
+def test_agent_browser_start_drives_cli_not_playwright(monkeypatch):
+    # start() must shell out to the real `agent-browser` CLI ("open"),
+    # never to Playwright's chromium.launch.
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agent-browser")
+    calls = []
+
+    def fake_run(self, *args, timeout=60.0, as_json=True):
+        calls.append(args)
+        if args and args[0] == "tab":
+            return []
+        return ""
+
+    monkeypatch.setattr(AgentBrowserBackend, "_run_sync", fake_run)
+    run(AgentBrowserBackend().start())
+    assert calls, "start() issued no CLI command"
+    assert calls[0][0] == "open", f"start() should run `agent-browser open`, got {calls[0]}"
+    assert all("agent-browser" not in str(c) for c in calls)  # args only; binary is prepended
+
+
+def test_agent_browser_tab_ops_use_cli(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agent-browser")
+    calls = []
+
+    def fake_run(self, *args, timeout=60.0, as_json=True):
+        calls.append(args)
+        if args[:2] == ("tab", "new"):
+            return {"tabId": "t7"}
+        if args[:1] == ("tab",) and len(args) == 1:
+            return [{"tabId": "t7", "title": "", "url": "", "active": True}]
+        return ""
+
+    monkeypatch.setattr(AgentBrowserBackend, "_run_sync", fake_run)
+    b = AgentBrowserBackend()
+    b._started = True
+    tid = run(b.create_tab("https://example.com"))
+    assert tid == "t7"
+    run(b.navigate(tid, "https://example.org"))
+    run(b.click(tid, 100, 200))
+    run(b.type_text(tid, "hello"))
+    run(b.press_key(tid, "Enter"))
+    run(b.scroll(tid, 0, 400))
+    subcmds = [c[0] for c in calls]
+    assert "tab" in subcmds and "open" in subcmds and "mouse" in subcmds
+    assert "keyboard" in subcmds and "press" in subcmds
 
 
 # ── start/stop contracts (no real browser launched) ─────────────────────
@@ -219,3 +276,72 @@ def test_chrome_stop_is_noop():
 
 def test_playwright_stop_without_start_is_safe():
     run(PlaywrightBackend().stop())  # must not raise
+
+
+# ── ObscuraBackend human behavior wiring ─────────────────────────────────
+
+import asyncio as _asyncio
+
+
+class _CdpRecorder:
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, method, **params):
+        self.calls.append((method, params))
+
+
+def _obscura_with_fake_cdp(human=True, seed=7):
+    b = ObscuraBackend(human=human, behavior_seed=seed)
+    rec = _CdpRecorder()
+    b._cdp = rec  # bypass the websocket; record CDP traffic
+    return b, rec
+
+
+def _no_sleep(monkeypatch):
+    async def fake_sleep(_):
+        return None
+    monkeypatch.setattr(_asyncio, "sleep", fake_sleep)
+
+
+def test_obscura_click_uses_bezier_path_when_human(monkeypatch):
+    _no_sleep(monkeypatch)
+    b, rec = _obscura_with_fake_cdp(human=True)
+    run(b.click("t1", 300, 200))
+    moves = [p for m, p in rec.calls
+             if m == "Input.dispatchMouseEvent" and p.get("type") == "mouseMoved"]
+    assert len(moves) >= 8, "human click must drive a Bezier path, not one jump"
+    presses = [p for m, p in rec.calls if p.get("type") == "mousePressed"]
+    assert len(presses) == 1
+    # Cursor tracks the click for the next move's Bezier start.
+    assert abs(b._cursor[0] - 300) <= 5
+
+
+def test_obscura_click_instant_when_not_human(monkeypatch):
+    _no_sleep(monkeypatch)
+    b, rec = _obscura_with_fake_cdp(human=False)
+    run(b.click("t1", 300, 200))
+    types = [p.get("type") for m, p in rec.calls]
+    assert types == ["mouseMoved", "mousePressed", "mouseReleased"]
+
+
+def test_obscura_type_text_uses_keystroke_dynamics(monkeypatch):
+    _no_sleep(monkeypatch)
+    b, rec = _obscura_with_fake_cdp(human=True)
+    run(b.type_text("t1", "hello"))
+    keys = [p for m, p in rec.calls if m == "Input.dispatchKeyEvent"]
+    downs = [p for p in keys if p["type"] == "keyDown"]
+    ups = [p for p in keys if p["type"] == "keyUp"]
+    assert len(downs) == len(ups) >= 5
+    assert "".join(p.get("text", "") for p in downs) == "hello"
+    # keyUp events exist (dwell time) — not insertText-style single events.
+    assert any(p["type"] == "keyUp" for p in keys)
+
+
+def test_obscura_scroll_uses_human_plan_when_human(monkeypatch):
+    _no_sleep(monkeypatch)
+    b, rec = _obscura_with_fake_cdp(human=True)
+    run(b.scroll("t1", 0, 400))
+    wheels = [p for m, p in rec.calls
+              if m == "Input.dispatchMouseEvent" and p.get("type") == "mouseWheel"]
+    assert len(wheels) >= 2, "human scroll must emit a wheel-event plan"
