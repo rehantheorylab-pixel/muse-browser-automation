@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/header.svg" alt="browser-bridge-for-muse" width="100%">
+</div>
+
 # browser-bridge-for-muse
 
 > **Unofficial. Not affiliated with, endorsed by, or supported by Meta.**
